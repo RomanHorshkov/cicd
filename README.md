@@ -27,6 +27,6 @@ Repo contract: `VERSION`, `utils/build_deb.sh` -> `build/debs/*.deb`, `app/<lib>
 
 ## Security
 
-Actions pinned by SHA, `contents: read` default, `persist-credentials: false`, no `${{ }}` in `run:`, secrets passed by name. `lint.yml`: zizmor + actionlint. `dependabot.yml`: action pins.
+Actions pinned by SHA, `contents: read` default, `persist-credentials: false`, no `${{ }}` in `run:`, secrets passed by name. `lint.yml`: zizmor + actionlint.
 
-Repo settings to set once: read-only workflow permissions, require SHA-pinned actions, rulesets on `master` and `v*` tags, Dependabot alerts, secret scanning, CodeQL, 2FA.
+Repo settings to set once: read-only workflow permissions, require SHA-pinned actions, rulesets on `master` and `v*` tags, secret scanning, CodeQL, 2FA.
