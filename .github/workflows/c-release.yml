@@ -63,8 +63,10 @@ jobs:
 
       - name: Verify tag matches VERSION
         if: startsWith(github.ref, 'refs/tags/')
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
         run: |
-          EXPECTED_TAG="v${{ steps.version.outputs.value }}"
+          EXPECTED_TAG="v${VERSION}"
           ACTUAL_TAG="${GITHUB_REF_NAME}"
           if [ "$ACTUAL_TAG" != "$EXPECTED_TAG" ]; then
             echo "Tag/version mismatch: expected $EXPECTED_TAG but got $ACTUAL_TAG"
@@ -72,10 +74,13 @@ jobs:
           fi
 
       - name: Install apt packages
-        env: { DEBIAN_FRONTEND: noninteractive }
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          APT_PACKAGES: ${{ inputs.apt-packages }}
         run: |
           sudo apt-get -yqq update
-          sudo apt-get -yqq install ${{ inputs.apt-packages }}
+          # shellcheck disable=SC2086 # deliberate word splitting of the package list
+          sudo apt-get -yqq install ${APT_PACKAGES}
 
       - name: Resolve dependencies (deps.txt)
         if: hashFiles('deps.txt') != ''
@@ -84,7 +89,7 @@ jobs:
           GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
         run: |
           ./utils/deps.sh install
-          [ -x ./utils/vendor.sh ] && ./utils/vendor.sh verify
+          if [ -x ./utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
           sudo ldconfig
 
       - name: Build Debian package (builds the release profile first)
@@ -112,12 +117,12 @@ jobs:
 
           (
             cd "${BUNDLE_DIR}"
-            sha256sum * > SHA256SUMS
+            sha256sum -- * > SHA256SUMS
           )
 
       - name: Generate build provenance attestation
         if: inputs.attest
-        uses: actions/attest-build-provenance@1c608d11d69870c2092266b3f9a6f3abbf17002c # v2.2.3
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: build/release-bundle/*
 
@@ -134,10 +139,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TITLE: ${{ inputs.title != '' && inputs.title || inputs.lib-name }}
-          CICD: "${{ github.job_workflow_ref }} @ ${{ github.job_workflow_sha }}"
         run: |
           gh release create "${GITHUB_REF_NAME}" \
             build/release-bundle/* \
             --generate-notes \
-            --notes "Built by cicd: ${CICD}" \
             --title "${TITLE} ${GITHUB_REF_NAME}"
