@@ -1,0 +1,143 @@
+name: C library release
+
+# Reusable release pipeline for the rh C libraries (workflow_call only).
+#
+# Caller contract (what the repository must provide):
+#   VERSION                  strict semver, must equal the pushed tag minus the leading v
+#   utils/build_deb.sh       builds the release profile and writes build/debs/*.deb
+#   app/<lib-name>.h         public header shipped in the tarball
+#   build/release/lib<lib-name>.a and lib<lib-name>.so.<version>
+#   deps.txt + utils/deps.sh (optional) resolved before the build when present
+#
+# The caller keeps its own quality gate (needs: on this job) and its own trigger. A
+# workflow_dispatch run skips the tag check and publishes nothing: it only uploads the
+# release-assets bundle for comparison.
+
+on:
+  workflow_call:
+    inputs:
+      lib-name:
+        description: "Library base name: app/<lib-name>.h, lib<lib-name>.{a,so}"
+        required: true
+        type: string
+      title:
+        description: "Release title prefix (default: lib-name)"
+        required: false
+        type: string
+        default: ""
+      attest:
+        description: "Attach a build-provenance attestation (public repos only)"
+        required: false
+        type: boolean
+        default: true
+      apt-packages:
+        description: "apt packages installed before the build"
+        required: false
+        type: string
+        default: "build-essential pkg-config fakeroot"
+    secrets:
+      SIBLING_REPOS_PAT:
+        description: "Token for private sibling releases read by utils/deps.sh (optional)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build, bundle, publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write       # create the GitHub release
+      id-token: write       # OIDC for build provenance attestation
+      attestations: write   # attach the attestation to the calling repo
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Read version
+        id: version
+        run: echo "value=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches VERSION
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          EXPECTED_TAG="v${{ steps.version.outputs.value }}"
+          ACTUAL_TAG="${GITHUB_REF_NAME}"
+          if [ "$ACTUAL_TAG" != "$EXPECTED_TAG" ]; then
+            echo "Tag/version mismatch: expected $EXPECTED_TAG but got $ACTUAL_TAG"
+            exit 1
+          fi
+
+      - name: Install apt packages
+        env: { DEBIAN_FRONTEND: noninteractive }
+        run: |
+          sudo apt-get -yqq update
+          sudo apt-get -yqq install ${{ inputs.apt-packages }}
+
+      - name: Resolve dependencies (deps.txt)
+        if: hashFiles('deps.txt') != ''
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          ./utils/deps.sh install
+          [ -x ./utils/vendor.sh ] && ./utils/vendor.sh verify
+          sudo ldconfig
+
+      - name: Build Debian package (builds the release profile first)
+        run: ./utils/build_deb.sh
+
+      - name: Assemble release bundle
+        env:
+          LIB: ${{ inputs.lib-name }}
+          VER: ${{ steps.version.outputs.value }}
+        run: |
+          STAGE_DIR="build/release-stage/${LIB}-${VER}"
+          BUNDLE_DIR="build/release-bundle"
+          mkdir -p "${STAGE_DIR}/include" "${STAGE_DIR}/lib" "${BUNDLE_DIR}"
+
+          cp "app/${LIB}.h" "${STAGE_DIR}/include/"
+          cp "build/release/lib${LIB}.a" "${STAGE_DIR}/lib/"
+          cp "build/release/lib${LIB}.so.${VER}" "${STAGE_DIR}/lib/"
+          ln -sf "lib${LIB}.so.${VER}" "${STAGE_DIR}/lib/lib${LIB}.so"
+
+          tar -C build/release-stage -czf \
+            "${BUNDLE_DIR}/${LIB}-${VER}-linux-x86_64.tar.gz" \
+            "${LIB}-${VER}"
+
+          cp build/debs/*.deb "${BUNDLE_DIR}/"
+
+          (
+            cd "${BUNDLE_DIR}"
+            sha256sum * > SHA256SUMS
+          )
+
+      - name: Generate build provenance attestation
+        if: inputs.attest
+        uses: actions/attest-build-provenance@1c608d11d69870c2092266b3f9a6f3abbf17002c # v2.2.3
+        with:
+          subject-path: build/release-bundle/*
+
+      - name: Upload workflow artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-assets
+          if-no-files-found: error
+          path: build/release-bundle/*
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: ${{ inputs.title != '' && inputs.title || inputs.lib-name }}
+          CICD: "${{ github.job_workflow_ref }} @ ${{ github.job_workflow_sha }}"
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            build/release-bundle/* \
+            --generate-notes \
+            --notes "Built by cicd: ${CICD}" \
+            --title "${TITLE} ${GITHUB_REF_NAME}"
