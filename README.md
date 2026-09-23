@@ -40,6 +40,18 @@ jobs:
 
 Inputs: `lib-name`, `strict-cflags`, `apt-packages` (default `pkg-config libcmocka-dev gcovr`), `tsan-runs-on`, `stress-timeout-minutes`.
 
+## c-app-quality.yml, c-app-release.yml
+
+For the deps.txt repositories (DB_*): `deps.sh install`, optional `vendor.sh verify`, build every profile, tests per profile (`build_tests.sh` first when present), optional fuzz smoke, package build + install (+ `smoke_test_package.sh` when present). Inputs: `profiles`, `profile-flag` (`--profile` for scripts that take it as an option), `fuzz-seconds`. The release runs `run_pipeline.sh` (then `build_deb.sh` if no deb came out), checksums, optional attestation, GitHub Release. Inputs: `title`, `attest` (default false). Both take the optional `SIBLING_REPOS_PAT` secret for private releases.
+
+```yaml
+jobs:
+  quality:
+    uses: RomanHorshkov/cicd/.github/workflows/c-app-quality.yml@v1
+    with: { profile-flag: "--profile" }
+    secrets: { SIBLING_REPOS_PAT: ${{ secrets.SIBLING_REPOS_PAT }} }
+```
+
 ## Security
 
 Actions pinned by SHA, `contents: read` default, `persist-credentials: false`, no `${{ }}` in `run:`, secrets passed by name. `lint.yml`: zizmor + actionlint.

@@ -1,0 +1,99 @@
+name: C app release
+
+# Reusable release for the deps.txt based repositories (workflow_call only).
+#
+# Caller contract: VERSION (strict semver, equal to the tag minus the leading v),
+# deps.txt + utils/deps.sh, utils/run_pipeline.sh (build + test; package too, or
+# utils/build_deb.sh is run after it), debs in build/debs/. A workflow_dispatch run
+# skips the tag check and publishes nothing.
+
+on:
+  workflow_call:
+    inputs:
+      title:
+        description: "Release title prefix"
+        required: true
+        type: string
+      attest:
+        description: "Attach a build-provenance attestation (public repos only)"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      SIBLING_REPOS_PAT:
+        description: "Token for private sibling releases read by utils/deps.sh (optional)"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  release:
+    name: Build, test, package, publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Read version
+        id: version
+        run: echo "value=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches VERSION
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "Tag/version mismatch: expected v${VERSION} but got ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+      - name: Resolve dependencies (deps.txt)
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          ./utils/deps.sh install
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          sudo ldconfig
+
+      - name: Full pipeline
+        run: |
+          ./utils/run_pipeline.sh
+          if ! ls build/debs/*.deb >/dev/null 2>&1; then ./utils/build_deb.sh; fi
+          (cd build/debs && sha256sum -- *.deb > SHA256SUMS)
+
+      - name: Generate build provenance attestation
+        if: inputs.attest
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: build/debs/*
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: release-assets
+          if-no-files-found: error
+          path: |
+            build/debs/*.deb
+            build/debs/SHA256SUMS
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: ${{ inputs.title }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            build/debs/*.deb build/debs/SHA256SUMS \
+            --generate-notes \
+            --title "${TITLE} ${GITHUB_REF_NAME}"
