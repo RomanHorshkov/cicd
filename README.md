@@ -42,7 +42,7 @@ Inputs: `lib-name`, `strict-cflags`, `apt-packages` (default `pkg-config libcmoc
 
 ## c-app-quality.yml, c-app-release.yml
 
-For the deps.txt repositories (DB_*): `deps.sh install`, optional `vendor.sh verify`, build every profile, tests per profile (`build_tests.sh` first when present), optional fuzz smoke, package build + install (+ `smoke_test_package.sh` when present). Inputs: `profiles`, `profile-flag` (`--profile` for scripts that take it as an option), `fuzz-seconds`. The release runs `run_pipeline.sh` (then `build_deb.sh` if no deb came out), checksums, optional attestation, GitHub Release. Inputs: `title`, `attest` (default false). Both take the optional `SIBLING_REPOS_PAT` secret for private releases.
+For the deps.txt repositories (DB_*): `deps.sh install`, optional `vendor.sh verify`, build every profile (`build_libs.sh` and/or `build_bin.sh`), tests per profile (`build_tests.sh` first when present), optional integration (`run_ITs.sh`), optional fuzz smoke, package build + install (+ `smoke_test_package.sh` when present). Inputs: `profiles`, `profile-flag` (`--profile` for scripts that take it as an option), `fuzz-seconds`. The release runs `run_pipeline.sh` (then `build_deb.sh` if no deb came out), checksums, optional attestation, GitHub Release. Inputs: `title`, `attest` (default false). Both take the optional `SIBLING_REPOS_PAT` secret for private releases.
 
 ```yaml
 jobs:

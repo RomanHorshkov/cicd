@@ -2,10 +2,11 @@ name: C app quality
 
 # Reusable quality gate for the deps.txt based repositories (workflow_call only).
 #
-# Caller contract: deps.txt + utils/deps.sh, utils/build_libs.sh <profile>,
-# utils/run_tests.sh <profile>, utils/build_deb.sh -> build/debs/*.deb. Optional:
-# utils/vendor.sh (verify), utils/build_tests.sh <profile> (built before run_tests.sh),
-# utils/run_fuzz_smoke.sh <seconds>, utils/smoke_test_package.sh (after the install).
+# Caller contract: deps.txt + utils/deps.sh, utils/build_libs.sh <profile> and/or
+# utils/build_bin.sh <profile>, utils/run_tests.sh <profile>, utils/build_deb.sh ->
+# build/debs/*.deb. Optional: utils/vendor.sh (verify), utils/build_tests.sh <profile>
+# (built before run_tests.sh), utils/run_ITs.sh (integration job), utils/run_fuzz_smoke.sh
+# <seconds>, utils/smoke_test_package.sh (after the install).
 # profile-flag is "--profile" for scripts that take the profile as an option.
 
 on:
@@ -45,6 +46,7 @@ jobs:
     outputs:
       profiles: ${{ steps.s.outputs.profiles }}
       build-tests: ${{ steps.s.outputs.build_tests }}
+      its: ${{ steps.s.outputs.its }}
       fuzz: ${{ steps.s.outputs.fuzz }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -61,6 +63,7 @@ jobs:
           {
             echo "profiles=${json}"
             echo "build_tests=$(has build_tests.sh)"
+            echo "its=$(has run_ITs.sh)"
             if [ "${FUZZ_SECONDS}" != "0" ] && [ -x utils/run_fuzz_smoke.sh ]; then echo "fuzz=true"; else echo "fuzz=false"; fi
           } >> "$GITHUB_OUTPUT"
 
@@ -85,7 +88,9 @@ jobs:
         run: |
           for profile in ${PROFILES}; do
             # shellcheck disable=SC2086
-            ./utils/build_libs.sh ${PROFILE_FLAG} "${profile}"
+            if [ -x utils/build_libs.sh ]; then ./utils/build_libs.sh ${PROFILE_FLAG} "${profile}"; fi
+            # shellcheck disable=SC2086
+            if [ -x utils/build_bin.sh ]; then ./utils/build_bin.sh ${PROFILE_FLAG} "${profile}"; fi
           done
 
   test:
@@ -114,7 +119,7 @@ jobs:
           PROFILE_FLAG: ${{ inputs.profile-flag }}
         run: |
           # shellcheck disable=SC2086
-          ./utils/build_libs.sh ${PROFILE_FLAG} "${PROFILE}"
+          if [ -x utils/build_libs.sh ]; then ./utils/build_libs.sh ${PROFILE_FLAG} "${PROFILE}"; fi
           # shellcheck disable=SC2086
           ./utils/build_tests.sh ${PROFILE_FLAG} "${PROFILE}"
       - env:
@@ -129,6 +134,31 @@ jobs:
           name: test-${{ matrix.profile }}
           if-no-files-found: ignore
           path: build/${{ matrix.profile }}/tests/**
+
+  integration:
+    name: Integration tests
+    needs: [detect, build]
+    if: needs.detect.outputs.its == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Resolve dependencies (deps.txt)
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          ./utils/deps.sh install
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          sudo ldconfig
+      - run: ./utils/run_ITs.sh
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: integration-results
+          if-no-files-found: ignore
+          path: tests/results
 
   fuzz-smoke:
     name: Fuzz harness smoke check
@@ -160,7 +190,8 @@ jobs:
 
   package:
     name: Package build + install
-    needs: [build, test]
+    needs: [build, test, integration]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
