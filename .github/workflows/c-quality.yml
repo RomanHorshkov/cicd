@@ -1,0 +1,273 @@
+name: C library quality
+
+# Reusable quality gate for the rh C libraries (workflow_call only).
+#
+# Caller contract: utils/format.sh --check, utils/build_libs.sh, app/<lib-name>.c,
+# utils/build_deb.sh -> build/debs/lib<lib-name>{,-dev}_<ver>_<arch>.deb,
+# utils/smoke_test_package.sh. Optional stages run only when their script exists:
+# build_UTs_release.sh + build_UTs.sh, build_ITs.sh (+ run_ITs.sh, build_ITs_release.sh),
+# build_stress.sh + run_stress.sh, build_sanitizer_tests.sh, build_tsan_tests.sh.
+
+on:
+  workflow_call:
+    inputs:
+      lib-name:
+        description: "Library base name: app/<lib-name>.c, packages lib<lib-name> and lib<lib-name>-dev"
+        required: true
+        type: string
+      strict-cflags:
+        description: "Flags for the gcc/clang strict compile of app/<lib-name>.c"
+        required: false
+        type: string
+        default: "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror"
+      apt-packages:
+        description: "apt packages installed in every job"
+        required: false
+        type: string
+        default: "pkg-config libcmocka-dev gcovr"
+      tsan-runs-on:
+        description: "Runner for the ThreadSanitizer job"
+        required: false
+        type: string
+        default: "ubuntu-latest"
+      stress-timeout-minutes:
+        required: false
+        type: number
+        default: 30
+
+permissions:
+  contents: read
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  detect:
+    name: Detect stages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      uts: ${{ steps.s.outputs.uts }}
+      its: ${{ steps.s.outputs.its }}
+      stress: ${{ steps.s.outputs.stress }}
+      sanitizers: ${{ steps.s.outputs.sanitizers }}
+      tsan: ${{ steps.s.outputs.tsan }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - id: s
+        run: |
+          has() { [ -x "utils/$1" ] && echo true || echo false; }
+          {
+            echo "uts=$(has build_UTs.sh)"
+            echo "its=$(has build_ITs.sh)"
+            echo "stress=$(has build_stress.sh)"
+            echo "sanitizers=$(has build_sanitizer_tests.sh)"
+            echo "tsan=$(has build_tsan_tests.sh)"
+          } >> "$GITHUB_OUTPUT"
+
+  format-check:
+    name: clang-format check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: |
+          sudo apt-get -yqq update
+          sudo apt-get -yqq install clang-format-18
+      - run: CLANG_FORMAT=clang-format-18 ./utils/format.sh --check
+
+  build:
+    name: Build (all profiles)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          sudo apt-get -yqq update
+          # shellcheck disable=SC2086
+          sudo apt-get -yqq install build-essential ${APT_PACKAGES}
+      - run: ./utils/build_libs.sh
+
+  compiler-portability:
+    name: Strict compile (${{ matrix.compiler }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: |
+          sudo apt-get -yqq update
+          sudo apt-get -yqq install build-essential clang
+      - env:
+          CC_BIN: ${{ matrix.compiler }}
+          LIB: ${{ inputs.lib-name }}
+          STRICT_CFLAGS: ${{ inputs.strict-cflags }}
+        run: |
+          # shellcheck disable=SC2086
+          "${CC_BIN}" ${STRICT_CFLAGS} -Iapp -c "app/${LIB}.c" -o "/tmp/${LIB}-${CC_BIN}.o"
+
+  unit-tests-coverage:
+    name: Unit tests + coverage
+    needs: [detect, build]
+    if: needs.detect.outputs.uts == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          sudo apt-get -yqq update
+          # shellcheck disable=SC2086
+          sudo apt-get -yqq install build-essential ${APT_PACKAGES}
+      - run: ./utils/build_UTs_release.sh
+      - run: ./utils/build_UTs.sh
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: uts-coverage
+          if-no-files-found: warn
+          path: tests/results/*UTs*
+
+  integration:
+    name: Integration tests
+    needs: [detect, build]
+    if: needs.detect.outputs.its == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          sudo apt-get -yqq update
+          # shellcheck disable=SC2086
+          sudo apt-get -yqq install build-essential ${APT_PACKAGES}
+      - run: ./utils/build_libs.sh
+      - run: ./utils/build_ITs.sh
+      - if: hashFiles('utils/run_ITs.sh') != ''
+        run: ./utils/run_ITs.sh
+      - if: hashFiles('utils/build_ITs_release.sh') != ''
+        run: ./utils/build_ITs_release.sh
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: integration-results
+          if-no-files-found: ignore
+          path: tests/results/ITs
+
+  stress:
+    name: Stress tests
+    needs: [detect, build]
+    if: needs.detect.outputs.stress == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.stress-timeout-minutes }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          sudo apt-get -yqq update
+          # shellcheck disable=SC2086
+          sudo apt-get -yqq install build-essential ${APT_PACKAGES}
+      - run: ./utils/build_stress.sh
+      - run: ./utils/run_stress.sh
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: stress-results
+          if-no-files-found: ignore
+          path: tests/results/stress
+
+  sanitizers:
+    name: ASan, UBSan, LSan
+    needs: [detect, integration]
+    if: needs.detect.outputs.sanitizers == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          sudo apt-get -yqq update
+          # shellcheck disable=SC2086
+          sudo apt-get -yqq install build-essential ${APT_PACKAGES}
+      - run: ./utils/build_sanitizer_tests.sh
+
+  thread-sanitizer:
+    name: ThreadSanitizer
+    needs: [detect, integration]
+    if: needs.detect.outputs.tsan == 'true'
+    runs-on: ${{ inputs.tsan-runs-on }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          sudo apt-get -yqq update
+          # shellcheck disable=SC2086
+          sudo apt-get -yqq install build-essential ${APT_PACKAGES}
+      - run: ./utils/build_tsan_tests.sh
+
+  package-smoke:
+    name: Package build + install + smoke test
+    needs: [build, format-check, compiler-portability, unit-tests-coverage, integration, sanitizers, thread-sanitizer]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          sudo apt-get -yqq update
+          # shellcheck disable=SC2086
+          sudo apt-get -yqq install build-essential fakeroot ${APT_PACKAGES}
+      - run: ./utils/build_deb.sh
+      - env:
+          LIB: ${{ inputs.lib-name }}
+        run: |
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          ARCH="$(dpkg --print-architecture)"
+          DEB_RT="build/debs/lib${LIB}_${VERSION}_${ARCH}.deb"
+          DEB_DEV="build/debs/lib${LIB}-dev_${VERSION}_${ARCH}.deb"
+          for f in "${DEB_RT}" "${DEB_DEV}"; do
+            [ -f "${f}" ] || { echo "expected package not found: ${f}" >&2; exit 1; }
+          done
+          sudo apt-get -yqq install "./${DEB_RT}" "./${DEB_DEV}"
+      - run: ./utils/smoke_test_package.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: deb-package
+          if-no-files-found: error
+          path: |
+            build/debs/*.deb
+            build/debs/SHA256SUMS
