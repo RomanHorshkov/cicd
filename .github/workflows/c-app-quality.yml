@@ -1,0 +1,187 @@
+name: C app quality
+
+# Reusable quality gate for the deps.txt based repositories (workflow_call only).
+#
+# Caller contract: deps.txt + utils/deps.sh, utils/build_libs.sh <profile>,
+# utils/run_tests.sh <profile>, utils/build_deb.sh -> build/debs/*.deb. Optional:
+# utils/vendor.sh (verify), utils/build_tests.sh <profile> (built before run_tests.sh),
+# utils/run_fuzz_smoke.sh <seconds>, utils/smoke_test_package.sh (after the install).
+# profile-flag is "--profile" for scripts that take the profile as an option.
+
+on:
+  workflow_call:
+    inputs:
+      profiles:
+        description: "Space separated build profiles"
+        required: false
+        type: string
+        default: "debug audit sanitize release native extreme"
+      profile-flag:
+        description: "Option name put before the profile, empty for a positional profile"
+        required: false
+        type: string
+        default: ""
+      fuzz-seconds:
+        description: "Bounded fuzz smoke pass length; 0 skips the job"
+        required: false
+        type: number
+        default: 45
+    secrets:
+      SIBLING_REPOS_PAT:
+        description: "Token for private sibling releases read by utils/deps.sh (optional)"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  detect:
+    name: Detect stages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      profiles: ${{ steps.s.outputs.profiles }}
+      build-tests: ${{ steps.s.outputs.build_tests }}
+      fuzz: ${{ steps.s.outputs.fuzz }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - id: s
+        env:
+          PROFILES: ${{ inputs.profiles }}
+          FUZZ_SECONDS: ${{ inputs.fuzz-seconds }}
+        run: |
+          has() { [ -x "utils/$1" ] && echo true || echo false; }
+          # shellcheck disable=SC2086
+          json="$(printf '%s\n' ${PROFILES} | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().split()))')"
+          {
+            echo "profiles=${json}"
+            echo "build_tests=$(has build_tests.sh)"
+            if [ "${FUZZ_SECONDS}" != "0" ] && [ -x utils/run_fuzz_smoke.sh ]; then echo "fuzz=true"; else echo "fuzz=false"; fi
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (all profiles)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Resolve dependencies (deps.txt)
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          ./utils/deps.sh install
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          sudo ldconfig
+      - env:
+          PROFILES: ${{ inputs.profiles }}
+          PROFILE_FLAG: ${{ inputs.profile-flag }}
+        run: |
+          for profile in ${PROFILES}; do
+            # shellcheck disable=SC2086
+            ./utils/build_libs.sh ${PROFILE_FLAG} "${profile}"
+          done
+
+  test:
+    name: Tests (${{ matrix.profile }})
+    needs: [detect, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ${{ fromJSON(needs.detect.outputs.profiles) }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Resolve dependencies (deps.txt)
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          ./utils/deps.sh install
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          sudo ldconfig
+      - if: needs.detect.outputs.build-tests == 'true'
+        env:
+          PROFILE: ${{ matrix.profile }}
+          PROFILE_FLAG: ${{ inputs.profile-flag }}
+        run: |
+          # shellcheck disable=SC2086
+          ./utils/build_libs.sh ${PROFILE_FLAG} "${PROFILE}"
+          # shellcheck disable=SC2086
+          ./utils/build_tests.sh ${PROFILE_FLAG} "${PROFILE}"
+      - env:
+          PROFILE: ${{ matrix.profile }}
+          PROFILE_FLAG: ${{ inputs.profile-flag }}
+        run: |
+          # shellcheck disable=SC2086
+          ./utils/run_tests.sh ${PROFILE_FLAG} "${PROFILE}"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-${{ matrix.profile }}
+          if-no-files-found: ignore
+          path: build/${{ matrix.profile }}/tests/**
+
+  fuzz-smoke:
+    name: Fuzz harness smoke check
+    needs: detect
+    if: needs.detect.outputs.fuzz == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: sudo apt-get -yqq install clang
+      - name: Resolve dependencies (deps.txt)
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          ./utils/deps.sh install
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          sudo ldconfig
+      - env:
+          FUZZ_SECONDS: ${{ inputs.fuzz-seconds }}
+        run: ./utils/run_fuzz_smoke.sh "${FUZZ_SECONDS}"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-crashes
+          if-no-files-found: ignore
+          path: tests/fuzz/crashes/crash-*
+
+  package:
+    name: Package build + install
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Resolve dependencies (deps.txt)
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          ./utils/deps.sh install
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          sudo ldconfig
+      - run: ./utils/build_deb.sh
+      - run: |
+          ls build/debs/*.deb >/dev/null || { echo "no .deb under build/debs" >&2; exit 1; }
+          sudo apt-get -yqq install ./build/debs/*.deb
+      - if: hashFiles('utils/smoke_test_package.sh') != ''
+        run: ./utils/smoke_test_package.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: deb-package
+          if-no-files-found: error
+          path: build/debs/*
