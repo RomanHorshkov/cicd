@@ -3,9 +3,9 @@ name: C app release
 # Reusable release for the deps.txt based repositories (workflow_call only).
 #
 # Caller contract: VERSION (strict semver, equal to the tag minus the leading v),
-# deps.txt + utils/deps.sh, utils/run_pipeline.sh (build + test; package too, or
-# utils/build_deb.sh is run after it), debs in build/debs/. A workflow_dispatch run
-# skips the tag check and publishes nothing.
+# deps.txt + utils/deps.sh, utils/build_deb.sh -> build/debs/*.deb. The caller keeps
+# its own quality gate (needs: on this job) and its own trigger. A workflow_dispatch
+# run skips the tag check and publishes nothing.
 
 on:
   workflow_call:
@@ -32,7 +32,7 @@ env:
 
 jobs:
   release:
-    name: Build, test, package, publish
+    name: Build, package, publish
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -66,10 +66,9 @@ jobs:
           if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
           sudo ldconfig
 
-      - name: Full pipeline
+      - name: Build Debian package
         run: |
-          ./utils/run_pipeline.sh
-          if ! ls build/debs/*.deb >/dev/null 2>&1; then ./utils/build_deb.sh; fi
+          ./utils/build_deb.sh
           (cd build/debs && sha256sum -- *.deb > SHA256SUMS)
 
       - name: Generate build provenance attestation
