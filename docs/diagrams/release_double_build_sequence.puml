@@ -1,0 +1,25 @@
+@startuml
+' claim: nothing is published unless two separate runners produced the same bytes
+participant "release.yml (caller)" as C
+participant "quality.yml" as Q
+participant "c-release: build 1" as B1
+participant "c-release: build 2" as B2
+participant "c-release: compare" as CMP
+participant "c-release: publish" as P
+participant "GitHub Release" as GH
+C -> Q : needs quality-gate
+Q --> C : green
+C -> B1 : tag == v<VERSION>?
+C -> B2 : tag == v<VERSION>?
+B1 -> B1 : bootstrap kyr-build (sha256), deps.sh sysroot, build_deb.sh with SOURCE_DATE_EPOCH = commit
+B2 -> B2 : the same, on another runner
+B1 --> CMP : release-build-1 (debs, .buildinfo, SHA256SUMS)
+B2 --> CMP : release-build-2
+CMP -> CMP : diff SHA256SUMS
+alt identical
+  CMP --> P : ok
+  P -> GH : gh release create <tag> debs SHA256SUMS buildinfo
+else different
+  CMP -> CMP : print buildinfo diffs, fail
+end
+@enduml

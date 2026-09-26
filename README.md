@@ -1,12 +1,23 @@
 # cicd
 
-Reusable GitHub Actions workflows for the rh C repositories. Callers pin a major tag (`@v1`); compatible fixes move the tag, breaking changes get `v2`.
+Reusable GitHub Actions workflows for the kyr repositories: one CI family, `c-quality.yml` and `c-release.yml`, parameterised by inputs. Tags `v<major>.<minor>.<patch>`; callers pin the major (`@v2`).
+
+## c-quality.yml
+
+`kind: lib` (foundation-style: `build_libs.sh`, `app/<lib-name>.c`, UTs, ITs, stress, sanitizers, TSan, `lib<lib-name>{,-dev}` debs) or `kind: app` (template-style: profiles matrix, `build_libs.sh`/`build_bin.sh <profile>`, `build_tests.sh`/`run_tests.sh <profile>`, `run_ITs.sh`, fuzz smoke, every deb). Every kind: kyr-build bootstrapped by the exact version and sha256 in `deps.txt` (no sudo, into `build/sysroot`), `deps.sh sysroot`, `deps.sh check --tiers` (the tier law), `template_check.sh` (no drift from the template), `format.sh --check` and `vendor.sh verify` when present, package build, install and smoke test. Artifacts: `uts-coverage`, `test-<profile>`, `integration-results`, `stress-results`, `fuzz-crashes`, `deb-package` (debs, `.buildinfo`, `SHA256SUMS`).
+
+Inputs: `kind` (required), `lib-name`, `strict-cflags`, `apt-packages`, `profiles`, `profile-flag`, `fuzz-seconds`, `tsan-runs-on`, `stress-timeout-minutes`. Secret: `SIBLING_REPOS_PAT` (optional).
+
+```yaml
+jobs:
+  quality:
+    uses: RomanHorshkov/cicd/.github/workflows/c-quality.yml@v2
+    with: { kind: lib, lib-name: spscring, strict-cflags: "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror -DSPSC_REQUIRE_ALWAYS_LOCK_FREE" }
+```
 
 ## c-release.yml
 
-Tag check against `VERSION`, `deps.txt` resolve (if present), `utils/build_deb.sh`, tarball + deb + `SHA256SUMS`, attestation, GitHub Release. `workflow_dispatch` publishes nothing.
-
-Caller:
+Tag check against `VERSION`, the same bootstrap, `utils/build_deb.sh` with `SOURCE_DATE_EPOCH` from the commit, bundle (debs, `.buildinfo`, `SHA256SUMS`; kind lib also `<lib-name>-<ver>-linux-x86_64.tar.gz`). Built twice on separate runners; `compare` diffs the two `SHA256SUMS` and prints the `.buildinfo` differences on a mismatch; `publish` runs only when they agree. `workflow_dispatch` publishes nothing. Inputs: `kind` (required), `lib-name`, `title`, `attest` (default false), `apt-packages`, `double-build` (default true).
 
 ```yaml
 jobs:
@@ -15,45 +26,20 @@ jobs:
   release:
     needs: quality-gate
     permissions: { contents: write, id-token: write, attestations: write }
-    uses: RomanHorshkov/cicd/.github/workflows/c-release.yml@v1
-    with: { lib-name: spscring, title: SPSCring }
+    uses: RomanHorshkov/cicd/.github/workflows/c-release.yml@v2
+    with: { kind: lib, lib-name: spscring, title: SPSCring }
     secrets:
       SIBLING_REPOS_PAT: ${{ secrets.SIBLING_REPOS_PAT }}
 ```
 
-Inputs: `lib-name`, `title`, `attest` (default true), `apt-packages`.
+## lint.yml
 
-Repo contract: `VERSION`, `utils/build_deb.sh` -> `build/debs/*.deb`, `app/<lib>.h`, `build/release/lib<lib>.{a,so.<ver>}`, optional `deps.txt` + `utils/deps.sh`.
-
-## c-quality.yml
-
-Quality gate: clang-format check, build, strict gcc/clang compile, then unit tests + coverage, integration, stress, sanitizers and TSan when the repo has the script, then package build + install + smoke. Artifacts: `uts-coverage`, `integration-results`, `stress-results`, `deb-package`.
-
-Caller (`quality.yml`, keeps its own triggers and concurrency, also `workflow_call` for release.yml):
-
-```yaml
-jobs:
-  quality:
-    uses: RomanHorshkov/cicd/.github/workflows/c-quality.yml@v1
-    with: { lib-name: spscring, strict-cflags: "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror -DSPSC_REQUIRE_ALWAYS_LOCK_FREE" }
-```
-
-Inputs: `lib-name`, `strict-cflags`, `apt-packages` (default `pkg-config libcmocka-dev gcovr`), `tsan-runs-on`, `stress-timeout-minutes`.
-
-## c-app-quality.yml, c-app-release.yml
-
-For the deps.txt repositories (DB_*): `deps.sh install`, optional `vendor.sh verify`, build every profile (`build_libs.sh` and/or `build_bin.sh`), tests per profile (`build_tests.sh` first when present), optional integration (`run_ITs.sh`), optional fuzz smoke, package build + install (+ `smoke_test_package.sh` when present). Inputs: `profiles`, `profile-flag` (`--profile` for scripts that take it as an option), `fuzz-seconds`. The release (behind the caller's quality gate, like c-release.yml) runs `build_deb.sh`, checksums, optional attestation, GitHub Release. Inputs: `title`, `attest` (default false). Both take the optional `SIBLING_REPOS_PAT` secret for private releases.
-
-```yaml
-jobs:
-  quality:
-    uses: RomanHorshkov/cicd/.github/workflows/c-app-quality.yml@v1
-    with: { profile-flag: "--profile" }
-    secrets: { SIBLING_REPOS_PAT: ${{ secrets.SIBLING_REPOS_PAT }} }
-```
+zizmor + actionlint over this repository's workflows, pinned. Callable from other repositories once D5 closes; not wired into any caller today.
 
 ## Security
 
-Actions pinned by SHA, `contents: read` default, `persist-credentials: false`, no `${{ }}` in `run:`, secrets passed by name. `lint.yml`: zizmor + actionlint.
+Actions pinned by SHA, `contents: read` default, `persist-credentials: false`, no `${{ }}` in `run:`, secrets passed by name, the build never touches `/usr/local` (the install step of the package job is the runner-as-VM lane).
 
 Repo settings to set once: read-only workflow permissions, require SHA-pinned actions, rulesets on `master` and `v*` tags, secret scanning, CodeQL, 2FA.
+
+Diagrams: `docs/diagrams/workflow_family_components.puml`, `docs/diagrams/release_double_build_sequence.puml`.

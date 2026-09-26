@@ -1,32 +1,58 @@
-name: C library quality
+name: C quality
 
-# Reusable quality gate for the rh C libraries (workflow_call only).
+# The one quality gate for every kyr repository (workflow_call only), parameterised by inputs.
 #
-# Caller contract: utils/format.sh --check, utils/build_libs.sh, app/<lib-name>.c,
-# utils/build_deb.sh -> build/debs/lib<lib-name>{,-dev}_<ver>_<arch>.deb,
-# utils/smoke_test_package.sh. Optional stages run only when their script exists:
-# build_UTs_release.sh + build_UTs.sh, build_ITs.sh (+ run_ITs.sh, build_ITs_release.sh),
-# build_stress.sh + run_stress.sh, build_sanitizer_tests.sh, build_tsan_tests.sh.
+#   kind: lib   foundation-style library: utils/build_libs.sh (every profile inside), app/<lib-name>.c, and the optional
+#               stages build_UTs_release.sh + build_UTs.sh, build_ITs.sh (+ run_ITs.sh, build_ITs_release.sh),
+#               build_stress.sh + run_stress.sh, build_sanitizer_tests.sh, build_tsan_tests.sh; package
+#               lib<lib-name>{,-dev}_<ver>_<arch>.deb + smoke_test_package.sh
+#   kind: app   template-style repository: utils/build_libs.sh <profile> and/or build_bin.sh <profile>, build_tests.sh
+#               <profile> (optional) + run_tests.sh <profile> per profile, run_ITs.sh (optional), run_fuzz_smoke.sh
+#               <seconds> (optional); package: every build/debs/*.deb (+ smoke_test_package.sh when present)
+#
+# Every repository: deps.txt with the pinned kyr-build (bootstrapped here by exact version and sha256, no sudo, into
+# build/sysroot), utils/deps.sh sysroot for every other pin, deps.sh check --tiers (the tier law), template_check.sh
+# (no drift from the template), utils/format.sh --check when present, utils/vendor.sh verify when present.
 
 on:
   workflow_call:
     inputs:
-      lib-name:
-        description: "Library base name: app/<lib-name>.c, packages lib<lib-name> and lib<lib-name>-dev"
+      kind:
+        description: "lib or app (see the header)"
         required: true
         type: string
+      lib-name:
+        description: "kind lib: app/<lib-name>.c, packages lib<lib-name> and lib<lib-name>-dev"
+        required: false
+        type: string
+        default: ""
       strict-cflags:
-        description: "Flags for the gcc/clang strict compile of app/<lib-name>.c"
+        description: "kind lib: flags for the gcc/clang strict compile of app/<lib-name>.c"
         required: false
         type: string
         default: "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror"
       apt-packages:
-        description: "apt packages installed in every job"
+        description: "apt packages installed in every job, on top of the apt lines of deps.txt"
         required: false
         type: string
         default: "pkg-config libcmocka-dev gcovr"
+      profiles:
+        description: "kind app: space separated build profiles"
+        required: false
+        type: string
+        default: "debug audit sanitize release native extreme"
+      profile-flag:
+        description: "kind app: option name put before the profile, empty for a positional profile"
+        required: false
+        type: string
+        default: ""
+      fuzz-seconds:
+        description: "kind app: bounded fuzz smoke pass length; 0 skips the job"
+        required: false
+        type: number
+        default: 45
       tsan-runs-on:
-        description: "Runner for the ThreadSanitizer job"
+        description: "kind lib: runner for the ThreadSanitizer job"
         required: false
         type: string
         default: "ubuntu-latest"
@@ -34,6 +60,10 @@ on:
         required: false
         type: number
         default: 30
+    secrets:
+      SIBLING_REPOS_PAT:
+        description: "Token for private sibling releases read by utils/deps.sh (optional)"
+        required: false
 
 permissions:
   contents: read
@@ -47,28 +77,88 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
+      format: ${{ steps.s.outputs.format }}
       uts: ${{ steps.s.outputs.uts }}
       its: ${{ steps.s.outputs.its }}
       stress: ${{ steps.s.outputs.stress }}
       sanitizers: ${{ steps.s.outputs.sanitizers }}
       tsan: ${{ steps.s.outputs.tsan }}
+      profiles: ${{ steps.s.outputs.profiles }}
+      build-tests: ${{ steps.s.outputs.build_tests }}
+      run-its: ${{ steps.s.outputs.run_its }}
+      fuzz: ${{ steps.s.outputs.fuzz }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
       - id: s
+        env:
+          KIND: ${{ inputs.kind }}
+          PROFILES: ${{ inputs.profiles }}
+          FUZZ_SECONDS: ${{ inputs.fuzz-seconds }}
         run: |
+          case "${KIND}" in lib|app) ;; *) echo "kind must be lib or app, got '${KIND}'" >&2; exit 1 ;; esac
+          [ -f deps.txt ] || { echo "deps.txt is missing: every repository pins kyr-build" >&2; exit 1; }
           has() { [ -x "utils/$1" ] && echo true || echo false; }
+          # shellcheck disable=SC2086
+          json="$(printf '%s\n' ${PROFILES} | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().split()))')"
           {
+            echo "format=$(has format.sh)"
             echo "uts=$(has build_UTs.sh)"
             echo "its=$(has build_ITs.sh)"
             echo "stress=$(has build_stress.sh)"
             echo "sanitizers=$(has build_sanitizer_tests.sh)"
             echo "tsan=$(has build_tsan_tests.sh)"
+            echo "profiles=${json}"
+            echo "build_tests=$(has build_tests.sh)"
+            echo "run_its=$(has run_ITs.sh)"
+            if [ "${FUZZ_SECONDS}" != "0" ] && [ -x utils/run_fuzz_smoke.sh ]; then echo "fuzz=true"; else echo "fuzz=false"; fi
           } >> "$GITHUB_OUTPUT"
+
+  dependency-law:
+    name: Dependency law and template
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install apt packages
+        env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          sudo apt-get -yqq update
+          # shellcheck disable=SC2046,SC2086
+          sudo apt-get -yqq install build-essential fakeroot ${APT_PACKAGES} $(awk '$1=="apt"{print $2}' deps.txt)
+      - name: Bootstrap kyr-build and resolve dependencies into the sysroot
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # kyr-build cannot pin itself through the file it ships: fetch the exact version deps.txt names, refuse any
+          # other sha256, extract it into the sysroot without sudo; the repository's deps.sh then resolves the rest.
+          read -r ver repo sha < <(awk '$1=="own" && $2=="kyr-build" {print $3, $4, $5}' deps.txt) || true
+          [ -n "${ver}" ] || { echo "deps.txt pins no kyr-build" >&2; exit 1; }
+          case "${sha}" in *[!0-9a-f]*|"") echo "the kyr-build pin carries no sha256" >&2; exit 1 ;; esac
+          [ "${#sha}" -eq 64 ] || { echo "the kyr-build pin's sha256 is malformed" >&2; exit 1; }
+          cache="${HOME}/.cache/rh-deps/debs"; mkdir -p "${cache}"
+          gh release download "v${ver}" --repo "${repo}" --pattern "kyr-build_${ver}_all.deb" --dir "${cache}" --clobber
+          echo "${sha}  ${cache}/kyr-build_${ver}_all.deb" | sha256sum --check --strict
+          rm -rf build/kyr-build-bootstrap build/sysroot/share/kyr-build
+          mkdir -p build/sysroot/share
+          dpkg-deb -x "${cache}/kyr-build_${ver}_all.deb" build/kyr-build-bootstrap
+          mv build/kyr-build-bootstrap/usr/local/share/kyr-build build/sysroot/share/kyr-build
+          ./utils/deps.sh sysroot
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          ./utils/deps.sh env --plain >> "$GITHUB_ENV"
+      - name: Tier law
+        run: ./utils/deps.sh check --tiers
+      - name: Template drift
+        run: build/sysroot/share/kyr-build/template_check.sh "$PWD"
 
   format-check:
     name: clang-format check
+    needs: detect
+    if: needs.detect.outputs.format == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -82,23 +172,58 @@ jobs:
 
   build:
     name: Build (all profiles)
+    needs: detect
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - env:
+      - name: Install apt packages
+        env:
           APT_PACKAGES: ${{ inputs.apt-packages }}
         run: |
           sudo apt-get -yqq update
-          # shellcheck disable=SC2086
-          sudo apt-get -yqq install build-essential ${APT_PACKAGES}
-      - run: ./utils/build_libs.sh
+          # shellcheck disable=SC2046,SC2086
+          sudo apt-get -yqq install build-essential fakeroot ${APT_PACKAGES} $(awk '$1=="apt"{print $2}' deps.txt)
+      - name: Bootstrap kyr-build and resolve dependencies into the sysroot
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # kyr-build cannot pin itself through the file it ships: fetch the exact version deps.txt names, refuse any
+          # other sha256, extract it into the sysroot without sudo; the repository's deps.sh then resolves the rest.
+          read -r ver repo sha < <(awk '$1=="own" && $2=="kyr-build" {print $3, $4, $5}' deps.txt) || true
+          [ -n "${ver}" ] || { echo "deps.txt pins no kyr-build" >&2; exit 1; }
+          case "${sha}" in *[!0-9a-f]*|"") echo "the kyr-build pin carries no sha256" >&2; exit 1 ;; esac
+          [ "${#sha}" -eq 64 ] || { echo "the kyr-build pin's sha256 is malformed" >&2; exit 1; }
+          cache="${HOME}/.cache/rh-deps/debs"; mkdir -p "${cache}"
+          gh release download "v${ver}" --repo "${repo}" --pattern "kyr-build_${ver}_all.deb" --dir "${cache}" --clobber
+          echo "${sha}  ${cache}/kyr-build_${ver}_all.deb" | sha256sum --check --strict
+          rm -rf build/kyr-build-bootstrap build/sysroot/share/kyr-build
+          mkdir -p build/sysroot/share
+          dpkg-deb -x "${cache}/kyr-build_${ver}_all.deb" build/kyr-build-bootstrap
+          mv build/kyr-build-bootstrap/usr/local/share/kyr-build build/sysroot/share/kyr-build
+          ./utils/deps.sh sysroot
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          ./utils/deps.sh env --plain >> "$GITHUB_ENV"
+      - if: inputs.kind == 'lib'
+        run: ./utils/build_libs.sh
+      - if: inputs.kind == 'app'
+        env:
+          PROFILES: ${{ inputs.profiles }}
+          PROFILE_FLAG: ${{ inputs.profile-flag }}
+        run: |
+          for profile in ${PROFILES}; do
+            # shellcheck disable=SC2086
+            if [ -x utils/build_libs.sh ]; then ./utils/build_libs.sh ${PROFILE_FLAG} "${profile}"; fi
+            # shellcheck disable=SC2086
+            if [ -x utils/build_bin.sh ]; then ./utils/build_bin.sh ${PROFILE_FLAG} "${profile}"; fi
+          done
 
   compiler-portability:
     name: Strict compile (${{ matrix.compiler }})
     needs: build
+    if: inputs.kind == 'lib'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -123,19 +248,40 @@ jobs:
   unit-tests-coverage:
     name: Unit tests + coverage
     needs: [detect, build]
-    if: needs.detect.outputs.uts == 'true'
+    if: inputs.kind == 'lib' && needs.detect.outputs.uts == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - env:
+      - name: Install apt packages
+        env:
           APT_PACKAGES: ${{ inputs.apt-packages }}
         run: |
           sudo apt-get -yqq update
-          # shellcheck disable=SC2086
-          sudo apt-get -yqq install build-essential ${APT_PACKAGES}
+          # shellcheck disable=SC2046,SC2086
+          sudo apt-get -yqq install build-essential fakeroot ${APT_PACKAGES} $(awk '$1=="apt"{print $2}' deps.txt)
+      - name: Bootstrap kyr-build and resolve dependencies into the sysroot
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # kyr-build cannot pin itself through the file it ships: fetch the exact version deps.txt names, refuse any
+          # other sha256, extract it into the sysroot without sudo; the repository's deps.sh then resolves the rest.
+          read -r ver repo sha < <(awk '$1=="own" && $2=="kyr-build" {print $3, $4, $5}' deps.txt) || true
+          [ -n "${ver}" ] || { echo "deps.txt pins no kyr-build" >&2; exit 1; }
+          case "${sha}" in *[!0-9a-f]*|"") echo "the kyr-build pin carries no sha256" >&2; exit 1 ;; esac
+          [ "${#sha}" -eq 64 ] || { echo "the kyr-build pin's sha256 is malformed" >&2; exit 1; }
+          cache="${HOME}/.cache/rh-deps/debs"; mkdir -p "${cache}"
+          gh release download "v${ver}" --repo "${repo}" --pattern "kyr-build_${ver}_all.deb" --dir "${cache}" --clobber
+          echo "${sha}  ${cache}/kyr-build_${ver}_all.deb" | sha256sum --check --strict
+          rm -rf build/kyr-build-bootstrap build/sysroot/share/kyr-build
+          mkdir -p build/sysroot/share
+          dpkg-deb -x "${cache}/kyr-build_${ver}_all.deb" build/kyr-build-bootstrap
+          mv build/kyr-build-bootstrap/usr/local/share/kyr-build build/sysroot/share/kyr-build
+          ./utils/deps.sh sysroot
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          ./utils/deps.sh env --plain >> "$GITHUB_ENV"
       - run: ./utils/build_UTs_release.sh
       - run: ./utils/build_UTs.sh
       - if: always()
@@ -145,51 +291,156 @@ jobs:
           if-no-files-found: warn
           path: tests/results/*UTs*
 
-  integration:
-    name: Integration tests
+  test:
+    name: Tests (${{ matrix.profile }})
     needs: [detect, build]
-    if: needs.detect.outputs.its == 'true'
+    if: inputs.kind == 'app'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ${{ fromJSON(needs.detect.outputs.profiles) }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - env:
+      - name: Install apt packages
+        env:
           APT_PACKAGES: ${{ inputs.apt-packages }}
         run: |
           sudo apt-get -yqq update
+          # shellcheck disable=SC2046,SC2086
+          sudo apt-get -yqq install build-essential fakeroot ${APT_PACKAGES} $(awk '$1=="apt"{print $2}' deps.txt)
+      - name: Bootstrap kyr-build and resolve dependencies into the sysroot
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # kyr-build cannot pin itself through the file it ships: fetch the exact version deps.txt names, refuse any
+          # other sha256, extract it into the sysroot without sudo; the repository's deps.sh then resolves the rest.
+          read -r ver repo sha < <(awk '$1=="own" && $2=="kyr-build" {print $3, $4, $5}' deps.txt) || true
+          [ -n "${ver}" ] || { echo "deps.txt pins no kyr-build" >&2; exit 1; }
+          case "${sha}" in *[!0-9a-f]*|"") echo "the kyr-build pin carries no sha256" >&2; exit 1 ;; esac
+          [ "${#sha}" -eq 64 ] || { echo "the kyr-build pin's sha256 is malformed" >&2; exit 1; }
+          cache="${HOME}/.cache/rh-deps/debs"; mkdir -p "${cache}"
+          gh release download "v${ver}" --repo "${repo}" --pattern "kyr-build_${ver}_all.deb" --dir "${cache}" --clobber
+          echo "${sha}  ${cache}/kyr-build_${ver}_all.deb" | sha256sum --check --strict
+          rm -rf build/kyr-build-bootstrap build/sysroot/share/kyr-build
+          mkdir -p build/sysroot/share
+          dpkg-deb -x "${cache}/kyr-build_${ver}_all.deb" build/kyr-build-bootstrap
+          mv build/kyr-build-bootstrap/usr/local/share/kyr-build build/sysroot/share/kyr-build
+          ./utils/deps.sh sysroot
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          ./utils/deps.sh env --plain >> "$GITHUB_ENV"
+      - env:
+          PROFILE: ${{ matrix.profile }}
+          PROFILE_FLAG: ${{ inputs.profile-flag }}
+          BUILD_TESTS: ${{ needs.detect.outputs.build-tests }}
+        run: |
           # shellcheck disable=SC2086
-          sudo apt-get -yqq install build-essential ${APT_PACKAGES}
-      - run: ./utils/build_libs.sh
-      - run: ./utils/build_ITs.sh
-      - if: hashFiles('utils/run_ITs.sh') != ''
-        run: ./utils/run_ITs.sh
-      - if: hashFiles('utils/build_ITs_release.sh') != ''
-        run: ./utils/build_ITs_release.sh
+          if [ -x utils/build_libs.sh ]; then ./utils/build_libs.sh ${PROFILE_FLAG} "${PROFILE}"; fi
+          # shellcheck disable=SC2086
+          if [ "${BUILD_TESTS}" = "true" ]; then ./utils/build_tests.sh ${PROFILE_FLAG} "${PROFILE}"; fi
+          # shellcheck disable=SC2086
+          ./utils/run_tests.sh ${PROFILE_FLAG} "${PROFILE}"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test-${{ matrix.profile }}
+          if-no-files-found: ignore
+          path: build/${{ matrix.profile }}/tests/**
+
+  integration:
+    name: Integration tests
+    needs: [detect, build]
+    if: (inputs.kind == 'lib' && needs.detect.outputs.its == 'true') || (inputs.kind == 'app' && needs.detect.outputs.run-its == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install apt packages
+        env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          sudo apt-get -yqq update
+          # shellcheck disable=SC2046,SC2086
+          sudo apt-get -yqq install build-essential fakeroot ${APT_PACKAGES} $(awk '$1=="apt"{print $2}' deps.txt)
+      - name: Bootstrap kyr-build and resolve dependencies into the sysroot
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # kyr-build cannot pin itself through the file it ships: fetch the exact version deps.txt names, refuse any
+          # other sha256, extract it into the sysroot without sudo; the repository's deps.sh then resolves the rest.
+          read -r ver repo sha < <(awk '$1=="own" && $2=="kyr-build" {print $3, $4, $5}' deps.txt) || true
+          [ -n "${ver}" ] || { echo "deps.txt pins no kyr-build" >&2; exit 1; }
+          case "${sha}" in *[!0-9a-f]*|"") echo "the kyr-build pin carries no sha256" >&2; exit 1 ;; esac
+          [ "${#sha}" -eq 64 ] || { echo "the kyr-build pin's sha256 is malformed" >&2; exit 1; }
+          cache="${HOME}/.cache/rh-deps/debs"; mkdir -p "${cache}"
+          gh release download "v${ver}" --repo "${repo}" --pattern "kyr-build_${ver}_all.deb" --dir "${cache}" --clobber
+          echo "${sha}  ${cache}/kyr-build_${ver}_all.deb" | sha256sum --check --strict
+          rm -rf build/kyr-build-bootstrap build/sysroot/share/kyr-build
+          mkdir -p build/sysroot/share
+          dpkg-deb -x "${cache}/kyr-build_${ver}_all.deb" build/kyr-build-bootstrap
+          mv build/kyr-build-bootstrap/usr/local/share/kyr-build build/sysroot/share/kyr-build
+          ./utils/deps.sh sysroot
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          ./utils/deps.sh env --plain >> "$GITHUB_ENV"
+      - if: inputs.kind == 'lib'
+        run: |
+          ./utils/build_libs.sh
+          ./utils/build_ITs.sh
+          if [ -x utils/run_ITs.sh ]; then ./utils/run_ITs.sh; fi
+          if [ -x utils/build_ITs_release.sh ]; then ./utils/build_ITs_release.sh; fi
+      - if: inputs.kind == 'app'
+        run: |
+          if [ -x utils/build_libs.sh ]; then ./utils/build_libs.sh release; fi
+          ./utils/run_ITs.sh
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: integration-results
           if-no-files-found: ignore
-          path: tests/results/ITs
+          path: tests/results
 
   stress:
     name: Stress tests
     needs: [detect, build]
-    if: needs.detect.outputs.stress == 'true'
+    if: inputs.kind == 'lib' && needs.detect.outputs.stress == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.stress-timeout-minutes }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - env:
+      - name: Install apt packages
+        env:
           APT_PACKAGES: ${{ inputs.apt-packages }}
         run: |
           sudo apt-get -yqq update
-          # shellcheck disable=SC2086
-          sudo apt-get -yqq install build-essential ${APT_PACKAGES}
+          # shellcheck disable=SC2046,SC2086
+          sudo apt-get -yqq install build-essential fakeroot ${APT_PACKAGES} $(awk '$1=="apt"{print $2}' deps.txt)
+      - name: Bootstrap kyr-build and resolve dependencies into the sysroot
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # kyr-build cannot pin itself through the file it ships: fetch the exact version deps.txt names, refuse any
+          # other sha256, extract it into the sysroot without sudo; the repository's deps.sh then resolves the rest.
+          read -r ver repo sha < <(awk '$1=="own" && $2=="kyr-build" {print $3, $4, $5}' deps.txt) || true
+          [ -n "${ver}" ] || { echo "deps.txt pins no kyr-build" >&2; exit 1; }
+          case "${sha}" in *[!0-9a-f]*|"") echo "the kyr-build pin carries no sha256" >&2; exit 1 ;; esac
+          [ "${#sha}" -eq 64 ] || { echo "the kyr-build pin's sha256 is malformed" >&2; exit 1; }
+          cache="${HOME}/.cache/rh-deps/debs"; mkdir -p "${cache}"
+          gh release download "v${ver}" --repo "${repo}" --pattern "kyr-build_${ver}_all.deb" --dir "${cache}" --clobber
+          echo "${sha}  ${cache}/kyr-build_${ver}_all.deb" | sha256sum --check --strict
+          rm -rf build/kyr-build-bootstrap build/sysroot/share/kyr-build
+          mkdir -p build/sysroot/share
+          dpkg-deb -x "${cache}/kyr-build_${ver}_all.deb" build/kyr-build-bootstrap
+          mv build/kyr-build-bootstrap/usr/local/share/kyr-build build/sysroot/share/kyr-build
+          ./utils/deps.sh sysroot
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          ./utils/deps.sh env --plain >> "$GITHUB_ENV"
       - run: ./utils/build_stress.sh
       - run: ./utils/run_stress.sh
       - if: always()
@@ -201,43 +452,132 @@ jobs:
 
   sanitizers:
     name: ASan, UBSan, LSan
-    needs: [detect, integration]
-    if: needs.detect.outputs.sanitizers == 'true'
+    needs: [detect, build]
+    if: inputs.kind == 'lib' && needs.detect.outputs.sanitizers == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - env:
+      - name: Install apt packages
+        env:
           APT_PACKAGES: ${{ inputs.apt-packages }}
         run: |
           sudo apt-get -yqq update
-          # shellcheck disable=SC2086
-          sudo apt-get -yqq install build-essential ${APT_PACKAGES}
+          # shellcheck disable=SC2046,SC2086
+          sudo apt-get -yqq install build-essential fakeroot ${APT_PACKAGES} $(awk '$1=="apt"{print $2}' deps.txt)
+      - name: Bootstrap kyr-build and resolve dependencies into the sysroot
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # kyr-build cannot pin itself through the file it ships: fetch the exact version deps.txt names, refuse any
+          # other sha256, extract it into the sysroot without sudo; the repository's deps.sh then resolves the rest.
+          read -r ver repo sha < <(awk '$1=="own" && $2=="kyr-build" {print $3, $4, $5}' deps.txt) || true
+          [ -n "${ver}" ] || { echo "deps.txt pins no kyr-build" >&2; exit 1; }
+          case "${sha}" in *[!0-9a-f]*|"") echo "the kyr-build pin carries no sha256" >&2; exit 1 ;; esac
+          [ "${#sha}" -eq 64 ] || { echo "the kyr-build pin's sha256 is malformed" >&2; exit 1; }
+          cache="${HOME}/.cache/rh-deps/debs"; mkdir -p "${cache}"
+          gh release download "v${ver}" --repo "${repo}" --pattern "kyr-build_${ver}_all.deb" --dir "${cache}" --clobber
+          echo "${sha}  ${cache}/kyr-build_${ver}_all.deb" | sha256sum --check --strict
+          rm -rf build/kyr-build-bootstrap build/sysroot/share/kyr-build
+          mkdir -p build/sysroot/share
+          dpkg-deb -x "${cache}/kyr-build_${ver}_all.deb" build/kyr-build-bootstrap
+          mv build/kyr-build-bootstrap/usr/local/share/kyr-build build/sysroot/share/kyr-build
+          ./utils/deps.sh sysroot
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          ./utils/deps.sh env --plain >> "$GITHUB_ENV"
       - run: ./utils/build_sanitizer_tests.sh
 
   thread-sanitizer:
     name: ThreadSanitizer
-    needs: [detect, integration]
-    if: needs.detect.outputs.tsan == 'true'
+    needs: [detect, build]
+    if: inputs.kind == 'lib' && needs.detect.outputs.tsan == 'true'
     runs-on: ${{ inputs.tsan-runs-on }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - env:
+      - name: Install apt packages
+        env:
           APT_PACKAGES: ${{ inputs.apt-packages }}
         run: |
           sudo apt-get -yqq update
-          # shellcheck disable=SC2086
-          sudo apt-get -yqq install build-essential ${APT_PACKAGES}
+          # shellcheck disable=SC2046,SC2086
+          sudo apt-get -yqq install build-essential fakeroot ${APT_PACKAGES} $(awk '$1=="apt"{print $2}' deps.txt)
+      - name: Bootstrap kyr-build and resolve dependencies into the sysroot
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # kyr-build cannot pin itself through the file it ships: fetch the exact version deps.txt names, refuse any
+          # other sha256, extract it into the sysroot without sudo; the repository's deps.sh then resolves the rest.
+          read -r ver repo sha < <(awk '$1=="own" && $2=="kyr-build" {print $3, $4, $5}' deps.txt) || true
+          [ -n "${ver}" ] || { echo "deps.txt pins no kyr-build" >&2; exit 1; }
+          case "${sha}" in *[!0-9a-f]*|"") echo "the kyr-build pin carries no sha256" >&2; exit 1 ;; esac
+          [ "${#sha}" -eq 64 ] || { echo "the kyr-build pin's sha256 is malformed" >&2; exit 1; }
+          cache="${HOME}/.cache/rh-deps/debs"; mkdir -p "${cache}"
+          gh release download "v${ver}" --repo "${repo}" --pattern "kyr-build_${ver}_all.deb" --dir "${cache}" --clobber
+          echo "${sha}  ${cache}/kyr-build_${ver}_all.deb" | sha256sum --check --strict
+          rm -rf build/kyr-build-bootstrap build/sysroot/share/kyr-build
+          mkdir -p build/sysroot/share
+          dpkg-deb -x "${cache}/kyr-build_${ver}_all.deb" build/kyr-build-bootstrap
+          mv build/kyr-build-bootstrap/usr/local/share/kyr-build build/sysroot/share/kyr-build
+          ./utils/deps.sh sysroot
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          ./utils/deps.sh env --plain >> "$GITHUB_ENV"
       - run: ./utils/build_tsan_tests.sh
+
+  fuzz-smoke:
+    name: Fuzz harness smoke check
+    needs: detect
+    if: inputs.kind == 'app' && needs.detect.outputs.fuzz == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install apt packages
+        env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          sudo apt-get -yqq update
+          # shellcheck disable=SC2046,SC2086
+          sudo apt-get -yqq install build-essential fakeroot clang ${APT_PACKAGES} $(awk '$1=="apt"{print $2}' deps.txt)
+      - name: Bootstrap kyr-build and resolve dependencies into the sysroot
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # kyr-build cannot pin itself through the file it ships: fetch the exact version deps.txt names, refuse any
+          # other sha256, extract it into the sysroot without sudo; the repository's deps.sh then resolves the rest.
+          read -r ver repo sha < <(awk '$1=="own" && $2=="kyr-build" {print $3, $4, $5}' deps.txt) || true
+          [ -n "${ver}" ] || { echo "deps.txt pins no kyr-build" >&2; exit 1; }
+          case "${sha}" in *[!0-9a-f]*|"") echo "the kyr-build pin carries no sha256" >&2; exit 1 ;; esac
+          [ "${#sha}" -eq 64 ] || { echo "the kyr-build pin's sha256 is malformed" >&2; exit 1; }
+          cache="${HOME}/.cache/rh-deps/debs"; mkdir -p "${cache}"
+          gh release download "v${ver}" --repo "${repo}" --pattern "kyr-build_${ver}_all.deb" --dir "${cache}" --clobber
+          echo "${sha}  ${cache}/kyr-build_${ver}_all.deb" | sha256sum --check --strict
+          rm -rf build/kyr-build-bootstrap build/sysroot/share/kyr-build
+          mkdir -p build/sysroot/share
+          dpkg-deb -x "${cache}/kyr-build_${ver}_all.deb" build/kyr-build-bootstrap
+          mv build/kyr-build-bootstrap/usr/local/share/kyr-build build/sysroot/share/kyr-build
+          ./utils/deps.sh sysroot
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          ./utils/deps.sh env --plain >> "$GITHUB_ENV"
+      - env:
+          FUZZ_SECONDS: ${{ inputs.fuzz-seconds }}
+        run: ./utils/run_fuzz_smoke.sh "${FUZZ_SECONDS}"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-crashes
+          if-no-files-found: ignore
+          path: tests/fuzz/crashes/crash-*
 
   package-smoke:
     name: Package build + install + smoke test
-    needs: [build, format-check, compiler-portability, unit-tests-coverage, integration, sanitizers, thread-sanitizer]
+    needs: [dependency-law, build, format-check, compiler-portability, unit-tests-coverage, test, integration, stress, sanitizers, thread-sanitizer, fuzz-smoke]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -245,29 +585,56 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - env:
+      - name: Install apt packages
+        env:
           APT_PACKAGES: ${{ inputs.apt-packages }}
         run: |
           sudo apt-get -yqq update
-          # shellcheck disable=SC2086
-          sudo apt-get -yqq install build-essential fakeroot ${APT_PACKAGES}
+          # shellcheck disable=SC2046,SC2086
+          sudo apt-get -yqq install build-essential fakeroot ${APT_PACKAGES} $(awk '$1=="apt"{print $2}' deps.txt)
+      - name: Bootstrap kyr-build and resolve dependencies into the sysroot
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # kyr-build cannot pin itself through the file it ships: fetch the exact version deps.txt names, refuse any
+          # other sha256, extract it into the sysroot without sudo; the repository's deps.sh then resolves the rest.
+          read -r ver repo sha < <(awk '$1=="own" && $2=="kyr-build" {print $3, $4, $5}' deps.txt) || true
+          [ -n "${ver}" ] || { echo "deps.txt pins no kyr-build" >&2; exit 1; }
+          case "${sha}" in *[!0-9a-f]*|"") echo "the kyr-build pin carries no sha256" >&2; exit 1 ;; esac
+          [ "${#sha}" -eq 64 ] || { echo "the kyr-build pin's sha256 is malformed" >&2; exit 1; }
+          cache="${HOME}/.cache/rh-deps/debs"; mkdir -p "${cache}"
+          gh release download "v${ver}" --repo "${repo}" --pattern "kyr-build_${ver}_all.deb" --dir "${cache}" --clobber
+          echo "${sha}  ${cache}/kyr-build_${ver}_all.deb" | sha256sum --check --strict
+          rm -rf build/kyr-build-bootstrap build/sysroot/share/kyr-build
+          mkdir -p build/sysroot/share
+          dpkg-deb -x "${cache}/kyr-build_${ver}_all.deb" build/kyr-build-bootstrap
+          mv build/kyr-build-bootstrap/usr/local/share/kyr-build build/sysroot/share/kyr-build
+          ./utils/deps.sh sysroot
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          ./utils/deps.sh env --plain >> "$GITHUB_ENV"
       - run: ./utils/build_deb.sh
-      - env:
+      - if: inputs.kind == 'lib'
+        env:
           LIB: ${{ inputs.lib-name }}
         run: |
           VERSION="$(tr -d '[:space:]' < VERSION)"
           ARCH="$(dpkg --print-architecture)"
-          DEB_RT="build/debs/lib${LIB}_${VERSION}_${ARCH}.deb"
-          DEB_DEV="build/debs/lib${LIB}-dev_${VERSION}_${ARCH}.deb"
-          for f in "${DEB_RT}" "${DEB_DEV}"; do
+          for f in "build/debs/lib${LIB}_${VERSION}_${ARCH}.deb" "build/debs/lib${LIB}-dev_${VERSION}_${ARCH}.deb"; do
             [ -f "${f}" ] || { echo "expected package not found: ${f}" >&2; exit 1; }
           done
-          sudo apt-get -yqq install "./${DEB_RT}" "./${DEB_DEV}"
-      - run: ./utils/smoke_test_package.sh
+      - name: Install the packages (the runner is the VM lane; the build itself never touched /usr/local)
+        run: |
+          ls build/debs/*.deb >/dev/null || { echo "no .deb under build/debs" >&2; exit 1; }
+          # First the pinned own debs from the cache deps.sh filled (runtime Depends), then ours.
+          if ls "${HOME}"/.cache/rh-deps/debs/*.deb >/dev/null 2>&1; then sudo apt-get -yqq install "${HOME}"/.cache/rh-deps/debs/*.deb; fi
+          sudo apt-get -yqq install ./build/debs/*.deb
+      - if: hashFiles('utils/smoke_test_package.sh') != ''
+        run: ./utils/smoke_test_package.sh
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: deb-package
           if-no-files-found: error
           path: |
             build/debs/*.deb
+            build/debs/*.buildinfo
             build/debs/SHA256SUMS

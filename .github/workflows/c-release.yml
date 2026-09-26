@@ -1,40 +1,48 @@
-name: C library release
+name: C release
 
-# Reusable release pipeline for the rh C libraries (workflow_call only).
+# The one release pipeline for every kyr repository (workflow_call only). The caller gates it with its quality
+# workflow (needs:) and keeps its own trigger.
 #
-# Caller contract (what the repository must provide):
-#   VERSION                  strict semver, must equal the pushed tag minus the leading v
-#   utils/build_deb.sh       builds the release profile and writes build/debs/*.deb
-#   app/<lib-name>.h         public header shipped in the tarball
-#   build/release/lib<lib-name>.a and lib<lib-name>.so.<version>
-#   deps.txt + utils/deps.sh (optional) resolved before the build when present
+#   VERSION must equal the pushed tag minus the leading v. deps.txt pins kyr-build (bootstrapped here by exact version
+#   and sha256, no sudo). utils/build_deb.sh writes build/debs/*.deb, SHA256SUMS and one .buildinfo per deb.
+#   kind lib also ships <lib-name>-<ver>-linux-x86_64.tar.gz (app/<lib-name>.h, build/release/lib<lib-name>.{a,so.<ver>}).
 #
-# The caller keeps its own quality gate (needs: on this job) and its own trigger. A
-# workflow_dispatch run skips the tag check and publishes nothing: it only uploads the
-# release-assets bundle for comparison.
+# Double build (plan 4.1): the release is built twice on two separate runners; publish refuses to run unless every
+# artifact hashes the same on both. A workflow_dispatch run skips the tag check and publishes nothing: it uploads the
+# bundle and the comparison for a workstation to reproduce.
 
 on:
   workflow_call:
     inputs:
-      lib-name:
-        description: "Library base name: app/<lib-name>.h, lib<lib-name>.{a,so}"
+      kind:
+        description: "lib or app (see the header)"
         required: true
         type: string
+      lib-name:
+        description: "kind lib: app/<lib-name>.h, lib<lib-name>.{a,so}"
+        required: false
+        type: string
+        default: ""
       title:
         description: "Release title prefix (default: lib-name)"
         required: false
         type: string
         default: ""
       attest:
-        description: "Attach a build-provenance attestation (public repos only)"
+        description: "Attach a build-provenance attestation (public repos only; never relied upon)"
+        required: false
+        type: boolean
+        default: false
+      apt-packages:
+        description: "apt packages installed before the build, on top of the apt lines of deps.txt"
+        required: false
+        type: string
+        default: "pkg-config"
+      double-build:
+        description: "Build twice on separate runners and compare every hash before publishing"
         required: false
         type: boolean
         default: true
-      apt-packages:
-        description: "apt packages installed before the build"
-        required: false
-        type: string
-        default: "build-essential pkg-config fakeroot"
     secrets:
       SIBLING_REPOS_PAT:
         description: "Token for private sibling releases read by utils/deps.sh (optional)"
@@ -43,82 +51,145 @@ on:
 permissions:
   contents: read
 
+env:
+  DEBIAN_FRONTEND: noninteractive
+
 jobs:
-  release:
-    name: Build, bundle, publish
+  build:
+    name: Build ${{ matrix.run }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: write       # create the GitHub release
-      id-token: write       # OIDC for build provenance attestation
-      attestations: write   # attach the attestation to the calling repo
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        run: ${{ fromJSON(inputs.double-build && '[1, 2]' || '[1]') }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-
-      - name: Read version
-        id: version
-        run: echo "value=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
-
       - name: Verify tag matches VERSION
         if: startsWith(github.ref, 'refs/tags/')
-        env:
-          VERSION: ${{ steps.version.outputs.value }}
         run: |
-          EXPECTED_TAG="v${VERSION}"
-          ACTUAL_TAG="${GITHUB_REF_NAME}"
-          if [ "$ACTUAL_TAG" != "$EXPECTED_TAG" ]; then
-            echo "Tag/version mismatch: expected $EXPECTED_TAG but got $ACTUAL_TAG"
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "Tag/version mismatch: expected v${VERSION} but got ${GITHUB_REF_NAME}"
             exit 1
           fi
-
       - name: Install apt packages
         env:
-          DEBIAN_FRONTEND: noninteractive
           APT_PACKAGES: ${{ inputs.apt-packages }}
         run: |
           sudo apt-get -yqq update
-          # shellcheck disable=SC2086 # deliberate word splitting of the package list
-          sudo apt-get -yqq install ${APT_PACKAGES}
-
-      - name: Resolve dependencies (deps.txt)
-        if: hashFiles('deps.txt') != ''
+          # shellcheck disable=SC2046,SC2086
+          sudo apt-get -yqq install build-essential fakeroot dpkg-dev ${APT_PACKAGES} $(awk '$1=="apt"{print $2}' deps.txt)
+      - name: Bootstrap kyr-build and resolve dependencies into the sysroot
         env:
-          DEBIAN_FRONTEND: noninteractive
           GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
         run: |
-          ./utils/deps.sh install
-          if [ -x ./utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
-          sudo ldconfig
-
-      - name: Build Debian package (builds the release profile first)
-        run: ./utils/build_deb.sh
-
-      - name: Assemble release bundle
-        env:
-          LIB: ${{ inputs.lib-name }}
-          VER: ${{ steps.version.outputs.value }}
+          # kyr-build cannot pin itself through the file it ships: fetch the exact version deps.txt names, refuse any
+          # other sha256, extract it into the sysroot without sudo; the repository's deps.sh then resolves the rest.
+          read -r ver repo sha < <(awk '$1=="own" && $2=="kyr-build" {print $3, $4, $5}' deps.txt) || true
+          if [ -z "${ver}" ]; then
+            echo "deps.txt pins no kyr-build: this is kyr_build itself, built from its own tree"
+            exit 0
+          fi
+          case "${sha}" in *[!0-9a-f]*|"") echo "the kyr-build pin carries no sha256" >&2; exit 1 ;; esac
+          [ "${#sha}" -eq 64 ] || { echo "the kyr-build pin's sha256 is malformed" >&2; exit 1; }
+          cache="${HOME}/.cache/rh-deps/debs"; mkdir -p "${cache}"
+          gh release download "v${ver}" --repo "${repo}" --pattern "kyr-build_${ver}_all.deb" --dir "${cache}" --clobber
+          echo "${sha}  ${cache}/kyr-build_${ver}_all.deb" | sha256sum --check --strict
+          rm -rf build/kyr-build-bootstrap build/sysroot/share/kyr-build
+          mkdir -p build/sysroot/share
+          dpkg-deb -x "${cache}/kyr-build_${ver}_all.deb" build/kyr-build-bootstrap
+          mv build/kyr-build-bootstrap/usr/local/share/kyr-build build/sysroot/share/kyr-build
+          ./utils/deps.sh sysroot
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          ./utils/deps.sh env --plain >> "$GITHUB_ENV"
+      - name: Build the Debian packages (release profile, deterministic)
         run: |
-          STAGE_DIR="build/release-stage/${LIB}-${VER}"
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          ./utils/build_deb.sh
+          ls build/debs/*.deb >/dev/null
+
+      - name: Assemble the release bundle
+        env:
+          KIND: ${{ inputs.kind }}
+          LIB: ${{ inputs.lib-name }}
+        run: |
+          VER="$(tr -d '[:space:]' < VERSION)"
           BUNDLE_DIR="build/release-bundle"
-          mkdir -p "${STAGE_DIR}/include" "${STAGE_DIR}/lib" "${BUNDLE_DIR}"
-
-          cp "app/${LIB}.h" "${STAGE_DIR}/include/"
-          cp "build/release/lib${LIB}.a" "${STAGE_DIR}/lib/"
-          cp "build/release/lib${LIB}.so.${VER}" "${STAGE_DIR}/lib/"
-          ln -sf "lib${LIB}.so.${VER}" "${STAGE_DIR}/lib/lib${LIB}.so"
-
-          tar -C build/release-stage -czf \
-            "${BUNDLE_DIR}/${LIB}-${VER}-linux-x86_64.tar.gz" \
-            "${LIB}-${VER}"
-
+          mkdir -p "${BUNDLE_DIR}"
           cp build/debs/*.deb "${BUNDLE_DIR}/"
-
+          cp build/debs/*.buildinfo "${BUNDLE_DIR}/" 2>/dev/null || true
+          if [ "${KIND}" = "lib" ]; then
+            STAGE_DIR="build/release-stage/${LIB}-${VER}"
+            mkdir -p "${STAGE_DIR}/include" "${STAGE_DIR}/lib"
+            cp "app/${LIB}.h" "${STAGE_DIR}/include/"
+            cp "build/release/lib${LIB}.a" "${STAGE_DIR}/lib/"
+            cp "build/release/lib${LIB}.so.${VER}" "${STAGE_DIR}/lib/"
+            ln -sf "lib${LIB}.so.${VER}" "${STAGE_DIR}/lib/lib${LIB}.so"
+            SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+            tar -C build/release-stage --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
+              --pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime -cf - "${LIB}-${VER}" \
+              | gzip -n > "${BUNDLE_DIR}/${LIB}-${VER}-linux-x86_64.tar.gz"
+          fi
           (
             cd "${BUNDLE_DIR}"
-            sha256sum -- * > SHA256SUMS
+            sha256sum -- *.deb ./*.tar.gz > SHA256SUMS 2>/dev/null || sha256sum -- *.deb > SHA256SUMS
           )
+          cat "${BUNDLE_DIR}/SHA256SUMS"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-build-${{ matrix.run }}
+          if-no-files-found: error
+          path: build/release-bundle/*
+
+  compare:
+    name: Compare the two builds
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-build-*
+          path: builds
+      - env:
+          DOUBLE: ${{ inputs.double-build }}
+        run: |
+          if [ "${DOUBLE}" != "true" ]; then
+            echo "double build disabled by the caller; nothing to compare"
+            exit 0
+          fi
+          [ -f builds/release-build-1/SHA256SUMS ] && [ -f builds/release-build-2/SHA256SUMS ] || { echo "both builds must upload SHA256SUMS" >&2; exit 1; }
+          if diff builds/release-build-1/SHA256SUMS builds/release-build-2/SHA256SUMS; then
+            echo "both runners produced the same bytes:"
+            cat builds/release-build-1/SHA256SUMS
+          else
+            echo "::error::the two runners produced different bytes; the release is not reproducible"
+            for b in builds/release-build-1/*.buildinfo; do
+              n="$(basename "${b}")"
+              diff -u "${b}" "builds/release-build-2/${n}" || true
+            done
+            exit 1
+          fi
+
+  publish:
+    name: Publish
+    needs: [build, compare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write       # create the GitHub release
+      id-token: write       # OIDC for the optional build provenance attestation
+      attestations: write   # attach the optional attestation to the calling repository
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-build-1
+          path: build/release-bundle
 
       - name: Generate build provenance attestation
         if: inputs.attest
@@ -126,9 +197,7 @@ jobs:
         with:
           subject-path: build/release-bundle/*
 
-      - name: Upload workflow artifacts
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-assets
           if-no-files-found: error
@@ -141,6 +210,7 @@ jobs:
           TITLE: ${{ inputs.title != '' && inputs.title || inputs.lib-name }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
             build/release-bundle/* \
             --generate-notes \
             --title "${TITLE} ${GITHUB_REF_NAME}"

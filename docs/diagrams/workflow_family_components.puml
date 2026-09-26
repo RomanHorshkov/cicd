@@ -1,0 +1,19 @@
+@startuml
+' claim: one CI family; every repository is a ten-line caller parameterised by kind
+package "cicd (tag v<major>.<minor>.<patch>, callers pin @v<major>)" {
+  [c-quality.yml] as Q
+  [c-release.yml] as R
+  [lint.yml] as L
+}
+package "a repository (.github/workflows)" {
+  [quality.yml] as q
+  [release.yml] as r
+  [security.yml] as s
+}
+q --> Q : uses, with kind: lib|app
+r --> q : needs (quality gate)
+r --> R : uses, with kind, title
+Q ..> [kyr-build deb] : bootstrap by version + sha256 from deps.txt
+R ..> [kyr-build deb] : bootstrap by version + sha256 from deps.txt
+L ..> "cicd itself" : zizmor + actionlint (D5 open: not wired into callers)
+@enduml
