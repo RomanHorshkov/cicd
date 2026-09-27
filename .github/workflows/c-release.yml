@@ -6,6 +6,7 @@ name: C release
 #   VERSION must equal the pushed tag minus the leading v. deps.txt pins kyr-build (bootstrapped here by exact version
 #   and sha256, no sudo). utils/build_deb.sh writes build/debs/*.deb, SHA256SUMS and one .buildinfo per deb.
 #   kind lib also ships <lib-name>-<ver>-linux-x86_64.tar.gz (app/<lib-name>.h, build/release/lib<lib-name>.{a,so.<ver>}).
+#   extra-assets adds any other files the repository builds (globs) to the bundle and to its SHA256SUMS.
 #
 # Double build (plan 4.1): the release is built twice on two separate runners; publish refuses to run unless every
 # artifact hashes the same on both. A workflow_dispatch run skips the tag check and publishes nothing: it uploads the
@@ -43,6 +44,11 @@ on:
         required: false
         type: boolean
         default: true
+      extra-assets:
+        description: "Space separated globs, relative to the checkout, copied into the release bundle beside the debs and covered by its SHA256SUMS (a no-C repository's tar, for example)"
+        required: false
+        type: string
+        default: ""
     secrets:
       SIBLING_REPOS_PAT:
         description: "Token for private sibling releases read by utils/deps.sh (optional)"
@@ -116,12 +122,22 @@ jobs:
         env:
           KIND: ${{ inputs.kind }}
           LIB: ${{ inputs.lib-name }}
+          EXTRA_ASSETS: ${{ inputs.extra-assets }}
         run: |
           VER="$(tr -d '[:space:]' < VERSION)"
           BUNDLE_DIR="build/release-bundle"
           mkdir -p "${BUNDLE_DIR}"
           cp build/debs/*.deb "${BUNDLE_DIR}/"
           cp build/debs/*.buildinfo "${BUNDLE_DIR}/" 2>/dev/null || true
+          # shellcheck disable=SC2086 # the globs are meant to split and expand
+          for pattern in ${EXTRA_ASSETS}; do
+            found=0
+            for f in ${pattern}; do
+              [ -f "${f}" ] || continue
+              cp "${f}" "${BUNDLE_DIR}/"; found=1
+            done
+            [ "${found}" = 1 ] || { echo "extra asset matches nothing: ${pattern}" >&2; exit 1; }
+          done
           if [ "${KIND}" = "lib" ]; then
             STAGE_DIR="build/release-stage/${LIB}-${VER}"
             mkdir -p "${STAGE_DIR}/include" "${STAGE_DIR}/lib"
@@ -136,7 +152,8 @@ jobs:
           fi
           (
             cd "${BUNDLE_DIR}"
-            sha256sum -- *.deb ./*.tar.gz > SHA256SUMS 2>/dev/null || sha256sum -- *.deb > SHA256SUMS
+            # every file of the bundle, sorted, so the two runners' SHA256SUMS compare line by line
+            find . -maxdepth 1 -type f ! -name SHA256SUMS ! -name '*.buildinfo' -printf '%f\n' | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
           )
           cat "${BUNDLE_DIR}/SHA256SUMS"
 

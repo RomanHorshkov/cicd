@@ -17,7 +17,7 @@ jobs:
 
 ## c-release.yml
 
-Tag check against `VERSION`, the same bootstrap, `utils/build_deb.sh` with `SOURCE_DATE_EPOCH` from the commit, bundle (debs, `.buildinfo`, `SHA256SUMS`; kind lib also `<lib-name>-<ver>-linux-x86_64.tar.gz`). Built twice on separate runners; `compare` diffs the two `SHA256SUMS` and prints the `.buildinfo` differences on a mismatch; `publish` runs only when they agree. `workflow_dispatch` publishes nothing. Inputs: `kind` (required), `lib-name`, `title`, `attest` (default false), `apt-packages`, `double-build` (default true).
+Tag check against `VERSION`, the same bootstrap, `utils/build_deb.sh` with `SOURCE_DATE_EPOCH` from the commit, bundle (debs, `.buildinfo`, `SHA256SUMS`; kind lib also `<lib-name>-<ver>-linux-x86_64.tar.gz`). Built twice on separate runners; `compare` diffs the two `SHA256SUMS` and prints the `.buildinfo` differences on a mismatch; `publish` runs only when they agree. `workflow_dispatch` publishes nothing. Inputs: `kind` (required), `lib-name`, `title`, `attest` (default false), `apt-packages`, `double-build` (default true), `extra-assets` (space-separated globs copied into the bundle beside the debs and covered by `SHA256SUMS`; a glob that matches nothing fails the build; how a no-C repository such as kyr_shell ships `build/release/kyr-shell_*.tar` with `kind: app`).
 
 ```yaml
 jobs:
