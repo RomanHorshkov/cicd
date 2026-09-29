@@ -14,6 +14,8 @@ q --> Q : uses, with kind: lib|app
 r --> q : needs (quality gate)
 r --> R : uses, with kind, title
 Q ..> [kyr-build deb] : bootstrap by version + sha256 from deps.txt
+Q ..> [utils/check_abi.sh] : job abi-gate when abi/layout.txt exists (full history, tags)
+R ..> [utils/check_abi.sh] : before packaging and after (exports): a failure publishes nothing
 R ..> [kyr-build deb] : bootstrap by version + sha256 from deps.txt
 L ..> "cicd itself" : zizmor + actionlint (D5 open: not wired into callers)
 @enduml

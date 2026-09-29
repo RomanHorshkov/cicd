@@ -11,7 +11,10 @@ C -> Q : needs quality-gate
 Q --> C : green
 C -> B1 : tag == v<VERSION>?
 C -> B2 : tag == v<VERSION>?
-B1 -> B1 : bootstrap kyr-build (sha256), deps.sh sysroot, build_deb.sh with SOURCE_DATE_EPOCH = commit
+B1 -> B1 : full history + tags; bootstrap kyr-build (sha256), deps.sh sysroot
+B1 -> B1 : abi/layout.txt? check_abi.sh (fails the build on an unraised ABI change)
+B1 -> B1 : build_deb.sh, SOURCE_DATE_EPOCH = last commit touching a build input (kyr-build >= 2.0.3)
+B1 -> B1 : abi/layout.txt? check_abi.sh --exports
 B2 -> B2 : the same, on another runner
 B1 --> CMP : release-build-1 (debs, .buildinfo, SHA256SUMS)
 B2 --> CMP : release-build-2
