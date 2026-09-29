@@ -13,6 +13,8 @@ name: C quality
 # Every repository: deps.txt with the pinned kyr-build (bootstrapped here by exact version and sha256, no sudo, into
 # build/sysroot), utils/deps.sh sysroot for every other pin, deps.sh check --tiers (the tier law), template_check.sh
 # (no drift from the template), utils/format.sh --check when present, utils/vendor.sh verify when present.
+# A repository with abi/layout.txt: the ABI gate (utils/check_abi.sh, kyr-build share/abi) on the full history and tags,
+# then the release library's exports (--exports); the package job waits for it.
 
 on:
   workflow_call:
@@ -87,6 +89,7 @@ jobs:
       build-tests: ${{ steps.s.outputs.build_tests }}
       run-its: ${{ steps.s.outputs.run_its }}
       fuzz: ${{ steps.s.outputs.fuzz }}
+      abi: ${{ steps.s.outputs.abi }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -113,6 +116,7 @@ jobs:
             echo "build_tests=$(has build_tests.sh)"
             echo "run_its=$(has run_ITs.sh)"
             if [ "${FUZZ_SECONDS}" != "0" ] && [ -x utils/run_fuzz_smoke.sh ]; then echo "fuzz=true"; else echo "fuzz=false"; fi
+            if [ -f abi/layout.txt ]; then echo "abi=true"; else echo "abi=false"; fi
           } >> "$GITHUB_OUTPUT"
 
   dependency-law:
@@ -154,6 +158,57 @@ jobs:
         run: ./utils/deps.sh check --tiers
       - name: Template drift
         run: build/sysroot/share/kyr-build/template_check.sh "$PWD"
+
+  abi-gate:
+    name: ABI gate (SemVer against the last release tag) and exports
+    needs: detect
+    if: needs.detect.outputs.abi == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0   # the version rule reads every commit that changed abi/layout.txt and the newest v<x.y.z> tag
+          fetch-tags: true
+      - name: Install apt packages
+        env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          sudo apt-get -yqq update
+          # shellcheck disable=SC2046,SC2086
+          sudo apt-get -yqq install build-essential fakeroot python3 binutils ${APT_PACKAGES} $(awk '$1=="apt"{print $2}' deps.txt)
+      - name: Bootstrap kyr-build and resolve dependencies into the sysroot
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # kyr-build cannot pin itself through the file it ships: fetch the exact version deps.txt names, refuse any
+          # other sha256, extract it into the sysroot without sudo; the repository's deps.sh then resolves the rest.
+          read -r ver repo sha < <(awk '$1=="own" && $2=="kyr-build" {print $3, $4, $5}' deps.txt) || true
+          [ -n "${ver}" ] || { echo "deps.txt pins no kyr-build" >&2; exit 1; }
+          case "${sha}" in *[!0-9a-f]*|"") echo "the kyr-build pin carries no sha256" >&2; exit 1 ;; esac
+          [ "${#sha}" -eq 64 ] || { echo "the kyr-build pin's sha256 is malformed" >&2; exit 1; }
+          cache="${HOME}/.cache/rh-deps/debs"; mkdir -p "${cache}"
+          gh release download "v${ver}" --repo "${repo}" --pattern "kyr-build_${ver}_all.deb" --dir "${cache}" --clobber
+          echo "${sha}  ${cache}/kyr-build_${ver}_all.deb" | sha256sum --check --strict
+          rm -rf build/kyr-build-bootstrap build/sysroot/share/kyr-build
+          mkdir -p build/sysroot/share
+          dpkg-deb -x "${cache}/kyr-build_${ver}_all.deb" build/kyr-build-bootstrap
+          mv build/kyr-build-bootstrap/usr/local/share/kyr-build build/sysroot/share/kyr-build
+          ./utils/deps.sh sysroot
+          if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
+          ./utils/deps.sh env --plain >> "$GITHUB_ENV"
+      - name: The public ABI against abi/layout.txt and the version rule
+        run: ./utils/check_abi.sh
+      - name: Build the release library
+        env:
+          KIND: ${{ inputs.kind }}
+          PROFILE_FLAG: ${{ inputs.profile-flag }}
+        run: |
+          # shellcheck disable=SC2086
+          if [ "${KIND}" = lib ]; then ./utils/build_libs.sh release; else ./utils/build_libs.sh ${PROFILE_FLAG} release; fi
+      - name: Exports, exactly the declared functions under <NODE>_<major>
+        run: ./utils/check_abi.sh --exports
 
   format-check:
     name: clang-format check
@@ -577,7 +632,7 @@ jobs:
 
   package-smoke:
     name: Package build + install + smoke test
-    needs: [dependency-law, build, format-check, compiler-portability, unit-tests-coverage, test, integration, stress, sanitizers, thread-sanitizer, fuzz-smoke]
+    needs: [dependency-law, abi-gate, build, format-check, compiler-portability, unit-tests-coverage, test, integration, stress, sanitizers, thread-sanitizer, fuzz-smoke]
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -585,6 +640,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          fetch-depth: 0   # the debs are dated by the last commit that touched a build input (kyr-build lib/epoch.sh)
       - name: Install apt packages
         env:
           APT_PACKAGES: ${{ inputs.apt-packages }}
