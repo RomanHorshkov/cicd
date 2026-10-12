@@ -12,7 +12,8 @@ name: C quality
 #
 # Every repository: deps.txt with the pinned kyr-build (bootstrapped here by exact version and sha256, no sudo, into
 # build/sysroot), utils/deps.sh sysroot for every other pin, deps.sh check --tiers (the tier law), template_check.sh
-# (no drift from the template), utils/format.sh --check when present, utils/vendor.sh verify when present.
+# (no drift from the template), check_legacy_names.sh (no pre-kyr name; kyr-build 3.0.0 on, skipped before),
+# utils/format.sh --check when present, utils/vendor.sh verify when present.
 # A repository with abi/layout.txt: the ABI gate (utils/check_abi.sh, kyr-build share/abi) on the full history and tags,
 # then the release library's exports (--exports); the package job waits for it.
 
@@ -158,6 +159,11 @@ jobs:
         run: ./utils/deps.sh check --tiers
       - name: Template drift
         run: build/sysroot/share/kyr-build/template_check.sh "$PWD"
+      - name: Legacy names
+        run: |
+          # kyr-build 3.0.0 and later ship the gate (check_legacy_names.sh, legacy_names.allow at the root); an older pin has none
+          gate=build/sysroot/share/kyr-build/check_legacy_names.sh
+          if [ -x "${gate}" ]; then "${gate}" "$PWD"; else echo "skipped: the pinned kyr-build predates 3.0.0"; fi
 
   abi-gate:
     name: ABI gate (SemVer against the last release tag) and exports

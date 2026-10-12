@@ -1,10 +1,10 @@
 # cicd
 
-Reusable GitHub Actions workflows for the kyr repositories: one CI family, `c-quality.yml` and `c-release.yml`, parameterised by inputs. Tags `v<major>.<minor>.<patch>`; callers pin the major (`@v2`). Current: v2.1.0 (see Versions).
+Reusable GitHub Actions workflows for the kyr repositories: one CI family, `c-quality.yml` and `c-release.yml`, parameterised by inputs. Tags `v<major>.<minor>.<patch>`; callers pin the major (`@v2`). Current: v2.2.0 (see Versions).
 
 ## c-quality.yml
 
-`kind: lib` (foundation-style: `build_libs.sh`, `app/<lib-name>.c`, UTs, ITs, stress, sanitizers, TSan, `lib<lib-name>{,-dev}` debs) or `kind: app` (template-style: profiles matrix, `build_libs.sh`/`build_bin.sh <profile>`, `build_tests.sh`/`run_tests.sh <profile>`, `run_ITs.sh`, fuzz smoke, every deb). Every kind: kyr-build bootstrapped by the exact version and sha256 in `deps.txt` (no sudo, into `build/sysroot`), `deps.sh sysroot`, `deps.sh check --tiers` (the tier law), `template_check.sh` (no drift from the template), `format.sh --check` and `vendor.sh verify` when present, the ABI gate when `abi/layout.txt` exists (job `abi-gate`: full history and tags, `utils/check_abi.sh`, then the release library and `utils/check_abi.sh --exports`; the package job waits for it), package build, install and smoke test. Artifacts: `uts-coverage`, `test-<profile>`, `integration-results`, `stress-results`, `fuzz-crashes`, `deb-package` (debs, `.buildinfo`, `SHA256SUMS`).
+`kind: lib` (foundation-style: `build_libs.sh`, `app/<lib-name>.c`, UTs, ITs, stress, sanitizers, TSan, `lib<lib-name>{,-dev}` debs) or `kind: app` (template-style: profiles matrix, `build_libs.sh`/`build_bin.sh <profile>`, `build_tests.sh`/`run_tests.sh <profile>`, `run_ITs.sh`, fuzz smoke, every deb). Every kind: kyr-build bootstrapped by the exact version and sha256 in `deps.txt` (no sudo, into `build/sysroot`), `deps.sh sysroot`, `deps.sh check --tiers` (the tier law), `template_check.sh` (no drift from the template), `check_legacy_names.sh` (no pre-kyr name outside the repository's `legacy_names.allow`; kyr-build 3.0.0 and later, skipped before), `format.sh --check` and `vendor.sh verify` when present, the ABI gate when `abi/layout.txt` exists (job `abi-gate`: full history and tags, `utils/check_abi.sh`, then the release library and `utils/check_abi.sh --exports`; the package job waits for it), package build, install and smoke test. Artifacts: `uts-coverage`, `test-<profile>`, `integration-results`, `stress-results`, `fuzz-crashes`, `deb-package` (debs, `.buildinfo`, `SHA256SUMS`).
 
 Inputs: `kind` (required), `lib-name`, `strict-cflags`, `apt-packages`, `profiles`, `profile-flag`, `fuzz-seconds`, `tsan-runs-on`, `stress-timeout-minutes`. Secret: `SIBLING_REPOS_PAT` (optional).
 
@@ -44,6 +44,7 @@ Repo settings to set once: read-only workflow permissions, require SHA-pinned ac
 
 ## Versions
 
+- v2.2.0 (to be tagged by the owner; `v2` moves with it): the Legacy names step in `c-quality` after Template drift, skipped while the pinned kyr-build predates 3.0.0.
 - v2.1.0 (to be tagged by the owner; `v2` moves with it): the ABI gate in `c-quality` (job `abi-gate`) and in `c-release` (refuses to package), `fetch-depth: 0` where the version rule or the build-input epoch reads history, the release epoch left to kyr-build 2.0.3's rule, the kind lib tar dated like its debs.
 - v2.0.0: one CI family, `kind: lib|app`, kyr-build bootstrap by version and sha256, tier and template checks, double build.
 
