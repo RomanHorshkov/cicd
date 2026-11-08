@@ -1,6 +1,6 @@
 # cicd
 
-Reusable GitHub Actions workflows for the kyr repositories: one CI family, `c-quality.yml` and `c-release.yml`, parameterised by inputs. Tags `v<major>.<minor>.<patch>`; callers pin the major (`@v2`). Current: v2.2.0, untagged (see Versions): the repository's only tag is `v1`, on the `c-app-*` workflows before the one family, so the callers' `@v2` waits for the owner's v2 tags.
+Reusable GitHub Actions workflows for the kyr repositories: one CI family, `c-quality.yml` and `c-release.yml`, parameterised by inputs. Tags `v<major>.<minor>.<patch>`; callers pin the major (`@v2`). Current: v2.2.0, with `v2` on the same commit (tagged 8 Nov 2026; until then the callers' `@v2` named no tag and every run failed as a workflow file issue). `v1` is the `c-app-*` workflows before the one family.
 
 ## c-quality.yml
 
@@ -44,8 +44,8 @@ Repo settings to set once: read-only workflow permissions, require SHA-pinned ac
 
 ## Versions
 
-- v2.2.0 (to be tagged by the owner; `v2` moves with it): the Legacy names step in `c-quality` after Template drift, skipped while the pinned kyr-build predates 3.0.0.
-- v2.1.0 (to be tagged by the owner; `v2` moves with it): the ABI gate in `c-quality` (job `abi-gate`) and in `c-release` (refuses to package), `fetch-depth: 0` where the version rule or the build-input epoch reads history, the release epoch left to kyr-build 2.0.3's rule, the kind lib tar dated like its debs.
-- v2.0.0 (to be tagged by the owner, with `v2`): one CI family, `kind: lib|app`, kyr-build bootstrap by version and sha256, tier and template checks, double build.
+- v2.2.0 (tagged 8 Nov 2026 at 63d3a49 with `v2`): the Legacy names step in `c-quality` after Template drift, skipped while the pinned kyr-build predates 3.0.0.
+- v2.1.0 (tagged 8 Nov 2026 at 333a4b3): the ABI gate in `c-quality` (job `abi-gate`) and in `c-release` (refuses to package), `fetch-depth: 0` where the version rule or the build-input epoch reads history, the release epoch left to kyr-build 2.0.3's rule, the kind lib tar dated like its debs.
+- v2.0.0 (tagged 8 Nov 2026 at 75dc93f): one CI family, `kind: lib|app`, kyr-build bootstrap by version and sha256, tier and template checks, double build.
 
 Diagrams: `docs/diagrams/workflow_family_components.puml`, `docs/diagrams/release_double_build_sequence.puml`.
