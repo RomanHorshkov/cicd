@@ -172,6 +172,7 @@ jobs:
           (
             cd "${BUNDLE_DIR}"
             # every file of the bundle, sorted, so the two runners' SHA256SUMS compare line by line
+            # shellcheck disable=SC2094 # find leaves SHA256SUMS out, so the pipeline never reads the file it writes
             find . -maxdepth 1 -type f ! -name SHA256SUMS ! -name '*.buildinfo' -printf '%f\n' | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
           )
           cat "${BUNDLE_DIR}/SHA256SUMS"

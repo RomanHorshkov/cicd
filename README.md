@@ -1,17 +1,17 @@
 # cicd
 
-Reusable GitHub Actions workflows for the kyr repositories: one CI family, `c-quality.yml` and `c-release.yml`, parameterised by inputs. Tags `v<major>.<minor>.<patch>`, never moved once pushed; callers pin the exact tag (`@v2.3.1`). Current: v2.3.1. `v2` stays on v2.2.0, the major the callers named until v2.3.0 (tagged 8 Nov 2026; until then their `@v2` named no tag and every run failed as a workflow file issue): moving it would take a force-push, so a caller still on `@v2` runs v2.2.0. `v1` is the `c-app-*` workflows before the one family.
+Reusable GitHub Actions workflows for the kyr repositories: one CI family, `c-quality.yml` and `c-release.yml`, parameterised by inputs. Tags `v<major>.<minor>.<patch>`, never moved once pushed; callers pin the exact tag (`@v2.3.2`). Current: v2.3.2. `v2` stays on v2.2.0, the major the callers named until v2.3.0 (tagged 8 Nov 2026; until then their `@v2` named no tag and every run failed as a workflow file issue): moving it would take a force-push, so a caller still on `@v2` runs v2.2.0. `v1` is the `c-app-*` workflows before the one family.
 
 ## c-quality.yml
 
-`kind: lib` (foundation-style: `build_libs.sh`, `app/<lib-name>.c`, UTs, ITs, stress, sanitizers, TSan on `tsan-runs-on` with `vm.mmap_rnd_bits=28` set first, `lib<lib-name>{,-dev}` debs) or `kind: app` (template-style: profiles matrix, `build_libs.sh`/`build_bin.sh <profile>`, `build_tests.sh`/`run_tests.sh <profile>`, `run_ITs.sh`, fuzz smoke, every deb). Every kind: kyr-build bootstrapped by the exact version and sha256 in `deps.txt` (no sudo, into `build/sysroot`), `deps.sh sysroot`, `deps.sh check --tiers` (the tier law), `template_check.sh` (no drift from the template), `check_legacy_names.sh` (no pre-kyr name outside the repository's `legacy_names.allow`; kyr-build 3.0.0 and later, skipped before), `format.sh --check` when present (job `format-check`: clang-format 18 and the pinned kyr-build alone, whose `share/format.sh` is the formatter), `vendor.sh verify` when present, the ABI gate when `abi/layout.txt` exists (job `abi-gate`: full history and tags, `utils/check_abi.sh`, then the release library and `utils/check_abi.sh --exports`; the package job waits for it), package build (`KYR_ALLOW_HOST_BUILD=1`: development debs on the runner, `Build-Root: none`), install and smoke test. Artifacts: `uts-coverage`, `test-<profile>`, `integration-results`, `stress-results`, `fuzz-crashes`, `deb-package` (debs, `.buildinfo`, `SHA256SUMS`).
+`kind: lib` (foundation-style: `build_libs.sh`, `app/<lib-name>.c`, UTs, ITs, stress, sanitizers, TSan on `tsan-runs-on` with `vm.mmap_rnd_bits=28` set first, `lib<lib-name>{,-dev}` debs) or `kind: app` (template-style: profiles matrix, `build_libs.sh`/`build_bin.sh <profile>`, `build_tests.sh`/`run_tests.sh <profile>`, `run_ITs.sh`, fuzz smoke, every deb). Every kind: kyr-build bootstrapped by the exact version and sha256 in `deps.txt` (no sudo, into `build/sysroot`), `deps.sh sysroot`, `deps.sh check --tiers` (the tier law), `template_check.sh` (no drift from the template), `check_legacy_names.sh` (no pre-kyr name outside the repository's `legacy_names.allow`; kyr-build 3.0.0 and later, skipped before), `format.sh --check` when present (job `format-check` on ubuntu-24.04, noble as the build root: clang-format 18 and the pinned kyr-build alone, whose `share/format.sh` is the formatter), `vendor.sh verify` when present, the ABI gate when `abi/layout.txt` exists (job `abi-gate`: full history and tags, `utils/check_abi.sh`, then the release library and `utils/check_abi.sh --exports`; the package job waits for it), package build (`KYR_ALLOW_HOST_BUILD=1`: development debs on the runner, `Build-Root: none`), install (with the runtime deb of every `static` `-dev` pin, from the same release, checked against its `SHA256SUMS`, which must list the pinned `-dev` deb at the pinned sha256) and smoke test. Artifacts: `uts-coverage`, `test-<profile>`, `integration-results`, `stress-results`, `fuzz-crashes`, `deb-package` (debs, `.buildinfo`, `SHA256SUMS`).
 
 Inputs: `kind` (required), `lib-name`, `strict-cflags`, `apt-packages`, `profiles`, `profile-flag`, `fuzz-seconds`, `tsan-runs-on`, `stress-timeout-minutes`. Secret: `SIBLING_REPOS_PAT` (optional).
 
 ```yaml
 jobs:
   quality:
-    uses: RomanHorshkov/cicd/.github/workflows/c-quality.yml@v2.3.1
+    uses: RomanHorshkov/cicd/.github/workflows/c-quality.yml@v2.3.2
     with: { kind: lib, lib-name: spscring, strict-cflags: "-std=c11 -O2 -Wall -Wextra -Wpedantic -Werror -DSPSC_REQUIRE_ALWAYS_LOCK_FREE" }
 ```
 
@@ -26,7 +26,7 @@ jobs:
   release:
     needs: quality-gate
     permissions: { contents: write, id-token: write, attestations: write }
-    uses: RomanHorshkov/cicd/.github/workflows/c-release.yml@v2.3.1
+    uses: RomanHorshkov/cicd/.github/workflows/c-release.yml@v2.3.2
     with: { kind: lib, lib-name: spscring, title: SPSCring }
     secrets:
       SIBLING_REPOS_PAT: ${{ secrets.SIBLING_REPOS_PAT }}
@@ -44,6 +44,7 @@ Repo settings to set once: read-only workflow permissions, require SHA-pinned ac
 
 ## Versions
 
+- v2.3.2 (tagged 10 Nov 2026): `format-check` runs on ubuntu-24.04: ubuntu-latest became 26.04, whose clang-format-18 (18.1.8) lays macro bodies out differently from noble's 18.1.3, the build root's, so trees the root left canonical failed there; `package-smoke` fetches the runtime deb of every `static` `-dev` pin whose runtime `deps.txt` does not pin (the `-dev` deb Depends on it at its version, so apt refused the install), from the same release and checked against that release's `SHA256SUMS`, itself trusted only when it lists the pinned `-dev` deb at the pinned sha256; `c-release`'s bundle sums carry a shellcheck note for SC2094 (find leaves `SHA256SUMS` out), which had kept this repository's actionlint red since 12 Oct.
 - v2.3.1 (tagged 10 Nov 2026): `package-smoke` builds its debs with `KYR_ALLOW_HOST_BUILD=1` (development debs for install and smoke, `Build-Root: none`, as kyr-build's `pipeline.sh` does on a host); kyr-build's `build_deb` (2.1.3 on) refuses a deb outside its pinned build root otherwise, so the job failed on every caller once the gates before it passed.
 - v2.3.0 (tagged 10 Nov 2026; `v2` not moved, callers pin `@v2.3.0`): `format-check` bootstraps the pinned kyr-build before `utils/format.sh --check` (the wrapper runs kyr-build's `share/format.sh`; without it every caller failed "kyr-build not found"); `thread-sanitizer` sets `vm.mmap_rnd_bits=28` before the run, so the job serves on ubuntu-latest and no caller needs the ubuntu-22.04 runner, whose libcmocka-dev 1.1.5 is under the `deps.txt` floor 1.1.7.
 - v2.2.0 (tagged 8 Nov 2026 at 63d3a49 with `v2`): the Legacy names step in `c-quality` after Template drift, skipped while the pinned kyr-build predates 3.0.0.
