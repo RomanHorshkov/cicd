@@ -713,39 +713,18 @@ jobs:
           for f in "build/debs/lib${LIB}_${VERSION}_${ARCH}.deb" "build/debs/lib${LIB}-dev_${VERSION}_${ARCH}.deb"; do
             [ -f "${f}" ] || { echo "expected package not found: ${f}" >&2; exit 1; }
           done
-      - name: Fetch the runtime deb of every static -dev pin (that -dev deb Depends on it)
-        env:
-          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
-        run: |
-          # A static -dev pin is linked at build time, so deps.sh fetched its -dev deb alone, which Depends on its runtime deb at
-          # the same version: apt cannot install it without. The runtime deb comes from the same release, checked against that
-          # release's SHA256SUMS, which is trusted only when it lists the pinned -dev deb at the pinned sha256. A runtime deps.txt
-          # pins itself is in the cache already and is left to deps.sh.
-          cache="${HOME}/.cache/rh-deps/debs"; arch="$(dpkg --print-architecture)"
-          mapfile -t pins < <(awk '$1=="own" && $2 ~ /-dev$/ {
-              s = 0; for (i = 5; i <= NF && $i !~ /^#/; i++) if ($i == "static") s = 1
-              if (s) print $2, $3, $4, (length($5) == 64 && $5 !~ /[^0-9a-f]/ ? $5 : "-") }' deps.txt)
-          for pin in "${pins[@]}"; do
-            read -r dev ver repo sha <<< "${pin}"
-            rt="${dev%-dev}"
-            if awk -v n="${rt}" '$1=="own" && $2==n {f=1} END {exit !f}' deps.txt; then continue; fi
-            [ "${sha}" != - ] || { echo "${dev} ${ver}: a static -dev pin needs its sha256 (it vouches for ${rt})" >&2; exit 1; }
-            sums="$(mktemp -d)"
-            gh release download "v${ver}" --repo "${repo}" --pattern SHA256SUMS --dir "${sums}" --clobber
-            awk -v h="${sha}" -v f="${dev}_${ver}_${arch}.deb" '$1==h && ($2==f || $2==("*" f)) {ok=1} END {exit !ok}' "${sums}/SHA256SUMS" \
-              || { echo "${repo} v${ver}: SHA256SUMS does not list ${dev}_${ver}_${arch}.deb at the pinned ${sha}" >&2; exit 1; }
-            read -r want deb < <(awk -v a="${rt}_${ver}_${arch}.deb" -v b="${rt}_${ver}_all.deb" \
-              '{n=$2; sub(/^\*/, "", n)} n==a || n==b {print $1, n; exit}' "${sums}/SHA256SUMS") || true
-            [ -n "${deb:-}" ] || { echo "${repo} v${ver}: SHA256SUMS lists no ${rt}_${ver} deb" >&2; exit 1; }
-            gh release download "v${ver}" --repo "${repo}" --pattern "${deb}" --dir "${cache}" --clobber
-            echo "${want}  ${cache}/${deb}" | sha256sum --check --strict
-            rm -rf "${sums}"; unset want deb
-          done
       - name: Install the packages (the runner is the VM lane; the build itself never touched /usr/local)
         run: |
           ls build/debs/*.deb >/dev/null || { echo "no .deb under build/debs" >&2; exit 1; }
-          # First the pinned own debs from the cache deps.sh filled (runtime Depends), then ours.
-          if ls "${HOME}"/.cache/rh-deps/debs/*.deb >/dev/null 2>&1; then sudo apt-get -yqq install "${HOME}"/.cache/rh-deps/debs/*.deb; fi
+          # First the pinned own debs ours Depend on, then ours. A static or a test pin is a build input, never a runtime Depends
+          # (kyr-build lib/deb.sh), so it is left out: its deb may ship what ours ships (kyr-server-rms and libkyr-rms both carry
+          # kyr-rms-cli); an optional pin is not fetched.
+          cache="${HOME}/.cache/rh-deps/debs"; runtime=()
+          while read -r name ver; do
+            for f in "${cache}/${name}_${ver}_"*.deb; do if [ -f "${f}" ]; then runtime+=("${f}"); fi; done
+          done < <(awk '$1 == "own" { skip = 0; for (i = 5; i <= NF && $i !~ /^#/; i++) if ($i == "static" || $i == "test" || $i == "optional") skip = 1
+                                      if (!skip) print $2, $3 }' deps.txt)
+          if [ "${#runtime[@]}" -gt 0 ]; then sudo apt-get -yqq install "${runtime[@]}"; fi
           sudo apt-get -yqq install ./build/debs/*.deb
       - if: hashFiles('utils/smoke_test_package.sh') != ''
         run: ./utils/smoke_test_package.sh
