@@ -55,7 +55,7 @@ on:
         type: number
         default: 45
       tsan-runs-on:
-        description: "kind lib: runner for the ThreadSanitizer job"
+        description: "kind lib: runner for the ThreadSanitizer job (it sets vm.mmap_rnd_bits=28 first, so ubuntu-latest serves)"
         required: false
         type: string
         default: "ubuntu-latest"
@@ -229,6 +229,23 @@ jobs:
       - run: |
           sudo apt-get -yqq update
           sudo apt-get -yqq install clang-format-18
+      - name: Bootstrap kyr-build into the sysroot (utils/format.sh runs its share/format.sh)
+        env:
+          GH_TOKEN: ${{ secrets.SIBLING_REPOS_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # The formatter is the pinned kyr-build's, so the job needs that one deb, fetched and verified as in every other
+          # job; no deps.sh sysroot: the gate reads no other pin and no apt package beyond clang-format.
+          read -r ver repo sha < <(awk '$1=="own" && $2=="kyr-build" {print $3, $4, $5}' deps.txt) || true
+          [ -n "${ver}" ] || { echo "deps.txt pins no kyr-build" >&2; exit 1; }
+          case "${sha}" in *[!0-9a-f]*|"") echo "the kyr-build pin carries no sha256" >&2; exit 1 ;; esac
+          [ "${#sha}" -eq 64 ] || { echo "the kyr-build pin's sha256 is malformed" >&2; exit 1; }
+          cache="${HOME}/.cache/rh-deps/debs"; mkdir -p "${cache}"
+          gh release download "v${ver}" --repo "${repo}" --pattern "kyr-build_${ver}_all.deb" --dir "${cache}" --clobber
+          echo "${sha}  ${cache}/kyr-build_${ver}_all.deb" | sha256sum --check --strict
+          rm -rf build/kyr-build-bootstrap build/sysroot/share/kyr-build
+          mkdir -p build/sysroot/share
+          dpkg-deb -x "${cache}/kyr-build_${ver}_all.deb" build/kyr-build-bootstrap
+          mv build/kyr-build-bootstrap/usr/local/share/kyr-build build/sysroot/share/kyr-build
       - run: CLANG_FORMAT=clang-format-18 ./utils/format.sh --check
 
   build:
@@ -587,6 +604,11 @@ jobs:
           ./utils/deps.sh sysroot
           if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
           ./utils/deps.sh env --plain >> "$GITHUB_ENV"
+      - name: Narrow mmap randomisation to 28 bits for TSan's fixed shadow layout
+        run: |
+          # The runner kernel's vm.mmap_rnd_bits=32 can place a mapping inside TSan's shadow ("unexpected memory mapping");
+          # 28 bits is the standard workaround, so the job runs on ubuntu-latest (kyr-build's tsan run adds setarch -R).
+          sudo sysctl -w vm.mmap_rnd_bits=28
       - run: ./utils/build_tsan_tests.sh
 
   fuzz-smoke:
