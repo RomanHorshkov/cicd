@@ -696,7 +696,12 @@ jobs:
           ./utils/deps.sh sysroot
           if [ -x utils/vendor.sh ]; then ./utils/vendor.sh verify; fi
           ./utils/deps.sh env --plain >> "$GITHUB_ENV"
-      - run: ./utils/build_deb.sh
+      - name: Build the debs on the runner (development debs, Build-Root none)
+        env:
+          # kyr-build's deb_release_check refuses a deb outside its pinned build root unless KYR_ALLOW_HOST_BUILD=1; the gate's
+          # debs are for install and smoke only, built on the host as kyr-build's own pipeline.sh does there.
+          KYR_ALLOW_HOST_BUILD: "1"
+        run: ./utils/build_deb.sh
       - if: inputs.kind == 'lib'
         env:
           LIB: ${{ inputs.lib-name }}
