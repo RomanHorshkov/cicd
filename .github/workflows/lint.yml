@@ -4,7 +4,9 @@ name: Lint workflows
 # Both installed at a pinned version through checksum-verifying package managers.
 
 on:
+  # master and pull requests only (the owner, 2026-11-11: one run per commit).
   push:
+    branches: [master]
   pull_request:
   workflow_dispatch:
 
